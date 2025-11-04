@@ -1,0 +1,6 @@
+aiohttp
+httpx
+beautifulsoup4
+PyYAML
+jsonschema
+rich
