@@ -8,12 +8,13 @@ sys.path.append(str(Path(__file__).parent))
 import argparse
 import logging
 import asyncio
+import re
 
 from torrent_automator.config import load_config
 from torrent_automator.nyaa import search_nyaa, extract_magnet
 from torrent_automator.qbittorrent import QBitClient
+from torrent_automator.anilist import fetch_anilist_progress
 
-import re
 
 def extract_episode_number(title: str) -> str | None:
     """
@@ -36,6 +37,7 @@ def extract_episode_number(title: str) -> str | None:
         if match:
             return match.group(1).zfill(2)
     return None
+
 
 def normalize_show_name(name: str) -> str:
     """
@@ -72,7 +74,7 @@ def main():
     parser.add_argument("--non-interactive", action="store_true", help="Auto-accept all matches")
     args = parser.parse_args()
 
-    interactive = not args.non_interactive  # This sets interactive mode correctly
+    interactive = not args.non_interactive
 
     # 🪵 Logging
     logging.basicConfig(level=logging.INFO)
@@ -81,9 +83,9 @@ def main():
         # 📂 Load config
         config = load_config(args.config)
         logging.info("✅ Config loaded successfully!")
-        logging.info(f"Shows: {config['shows']}")
+        logging.info(f"Shows from config: {config['shows']}")
 
-        # 🔐 Create and login to qBittorrent
+        # 🔐 Login to qBittorrent
         qb = QBitClient(
             host=config["qbittorrent"]["host"],
             port=config["qbittorrent"]["port"],
@@ -92,52 +94,73 @@ def main():
             use_https=config["qbittorrent"].get("https", False)
         )
         qb.login()
-        
-        processed_episodes = {}  # { show_name: set(["01", "02", ...]) }
 
-        # 🔍 Search for torrents and process each one
+        # 📡 Get AniList progress (Watching list only)
+        anilist_progress = {}
+        if "anilist_username" in config:
+            logging.info("🔗 Fetching AniList 'Watching' list...")
+            anilist_progress = asyncio.run(fetch_anilist_progress(config["anilist_username"]))
+            print("📺 AniList Watching List:")
+            for title, ep in anilist_progress.items():
+                print(f"  {title} → Ep {ep}")
+
+        processed_episodes = {}
+
+        # 🔍 Search only for shows that exist in AniList 'Watching'
         for show in config["shows"]:
+            show_key = show.lower()
+            matched_title = None
+
+            # Find matching AniList entry (substring match)
+            for ani_title in anilist_progress:
+                if ani_title in show_key or show_key in ani_title:
+                    matched_title = ani_title
+                    break
+
+            if not matched_title:
+                print(f"⏭️ '{show}' is not in your AniList 'Watching' list, skipping.")
+                continue
+
+            last_seen = anilist_progress[matched_title]
+            print(f"\n📺 {matched_title}: Last watched episode {last_seen}")
+
+            # Build Nyaa query
             query = f"{show} {config['quality']} {config['codec']}"
             results = asyncio.run(search_nyaa(query, allowed_groups=config.get("release_groups")))
 
-            print(f"\nResults for '{query}':")
+            # Filter to unwatched episodes only
+            filtered_results = []
             for r in results:
+                ep_num = extract_episode_number(r["title"])
+                try:
+                    if ep_num and int(ep_num) > last_seen:
+                        filtered_results.append(r)
+                except ValueError:
+                    pass
+
+            if not filtered_results:
+                print(f"⏭️ No new episodes for {show}")
+                continue
+
+            print(f"🔍 Found {len(filtered_results)} new episode(s) for {show}")
+
+            # Process only filtered results
+            for r in filtered_results:
                 magnet = asyncio.run(extract_magnet(r["link"]))
-                if magnet:
-                    r["magnet"] = magnet
-                    
-                    episode_num = extract_episode_number(r["title"])
-                    show_key = normalize_show_name(show)
+                if not magnet:
+                    print(f"⚠️ Magnet not found for {r['title']}")
+                    continue
 
-                    # Create tracking set for this show if missing
-                    if show_key not in processed_episodes:
-                        processed_episodes[show_key] = set()
-
-                    # Skip if already downloaded/accepted
-                    if episode_num and episode_num in processed_episodes[show_key]:
-                        print(f"⏭️ Skipping duplicate episode {episode_num} for {show}")
+                if interactive:
+                    if not ask_user_to_accept(r["title"], magnet):
+                        print("⏭️ Skipped by user.")
                         continue
 
-                    # Ask user to confirm if in interactive mode
-                    if interactive:
-                        if not ask_user_to_accept(r["title"], magnet):
-                            print("⏭️ Skipped.")
-                            continue
-
-                    # Add magnet to qBittorrent
-                    try:
-                        qb.add_magnet(magnet)
-                        print("✅ Sent to qBittorrent")
-                        if episode_num:
-                            processed_episodes[show_key].add(episode_num)
-                    except Exception as e:
-                        print(f"❌ Failed to add: {e}")
-                        
-                    print(f"🔍 Parsed episode: {episode_num}, show key: {show_key}")
-
-                else:
-                    print(f"- {r['title']}")
-                    print("⚠️ Magnet not found")
+                try:
+                    qb.add_magnet(magnet)
+                    print(f"✅ Sent {r['title']} to qBittorrent")
+                except Exception as e:
+                    print(f"❌ Failed to add {r['title']}: {e}")
 
     except Exception as e:
         logging.error(f"❌ Failed: {e}")
