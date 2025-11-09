@@ -9,6 +9,7 @@ import argparse
 import logging
 import asyncio
 import re
+from difflib import SequenceMatcher  # 🟩 added
 
 from torrent_automator.config import load_config
 from torrent_automator.nyaa import search_nyaa, extract_magnet
@@ -29,34 +30,39 @@ def extract_episode_number(title: str) -> str | None:
     patterns = [
         r"[ _-][Ee][Pp]?\s?(\d{1,3}(?:v\d)?)",      # Ep 03, E03, - 03, etc.
         r"[Ss]\d{1,2}[Ee](\d{1,3}(?:v\d)?)",         # S03E07 or S1E2
+        r"(?:Episode\s*)(\d{1,3}(?:v\d)?)",          # Episode 03
         r"[ _-](\d{1,3}(?:v\d)?)"                    # fallback simple number
     ]
 
     for pat in patterns:
         match = re.search(pat, title)
         if match:
-            return match.group(1).zfill(2)
+            ep = match.group(1)
+            # 🟩 skip 720, 1080, 2160 numbers
+            if ep in ("720", "1080", "2160"):
+                continue
+            return ep.zfill(2)
     return None
 
 
 def normalize_show_name(name: str) -> str:
-    """
-    Simplify show names for consistent comparison (case-insensitive).
-    Removes brackets and extra spaces.
-    """
-    name = re.sub(r"\[.*?\]", "", name)  # remove [Group] tags
-    name = re.sub(r"\s+", " ", name)     # normalize spaces
+    """Simplify show names for consistent comparison (case-insensitive)."""
+    name = re.sub(r"\[.*?\]", "", name)
+    name = re.sub(r"\(.*?\)", "", name)  # 🟩 remove parentheses too
+    name = re.sub(r"[^a-zA-Z0-9\s]", "", name)  # 🟩 strip symbols
+    name = re.sub(r"\s+", " ", name)
     return name.lower().strip()
 
 
+def similarity(a: str, b: str) -> float:  # 🟩 added fuzzy matching helper
+    return SequenceMatcher(None, a, b).ratio()
+
+
 def ask_user_to_accept(title: str, magnet: str) -> bool:
-    """
-    Ask the user whether to accept this torrent for download.
-    """
+    """Ask the user whether to accept this torrent for download."""
     print("\n🔹 Torrent:")
     print(f"Title : {title}")
-    print(f"Magnet: {magnet[:60]}...")  # Truncate for readability
-
+    print(f"Magnet: {magnet[:60]}...")
     while True:
         choice = input("Add this torrent to qBittorrent? [y/N]: ").strip().lower()
         if choice in ("y", "yes"):
@@ -67,25 +73,15 @@ def ask_user_to_accept(title: str, magnet: str) -> bool:
             print("Please enter 'y' or 'n'.")
 
 
-def main():
-    # 🧾 Argument parsing
-    parser = argparse.ArgumentParser(description="Torrent Automator Tool")
-    parser.add_argument("--config", type=str, required=True, help="Path to config.yaml")
-    parser.add_argument("--non-interactive", action="store_true", help="Auto-accept all matches")
-    args = parser.parse_args()
-
-    interactive = not args.non_interactive
-
-    # 🪵 Logging
+# 🟩 fully async main to avoid repeated asyncio.run()
+async def main_async(args):
     logging.basicConfig(level=logging.INFO)
 
     try:
-        # 📂 Load config
         config = load_config(args.config)
         logging.info("✅ Config loaded successfully!")
         logging.info(f"Shows from config: {config['shows']}")
 
-        # 🔐 Login to qBittorrent
         qb = QBitClient(
             host=config["qbittorrent"]["host"],
             port=config["qbittorrent"]["port"],
@@ -95,45 +91,41 @@ def main():
         )
         qb.login()
 
-        # 📡 Get AniList progress (Watching list only)
+        # 📡 AniList fetch
         anilist_progress = {}
         if "anilist_username" in config:
             logging.info("🔗 Fetching AniList 'Watching' list...")
-            anilist_progress = asyncio.run(fetch_anilist_progress(config["anilist_username"]))
+            anilist_progress = await fetch_anilist_progress(config["anilist_username"])
             print("📺 AniList Watching List:")
             for title, ep in anilist_progress.items():
                 print(f"  {title} → Ep {ep}")
 
-        processed_episodes = {}
-
-        # 🔍 Search only for shows that exist in AniList 'Watching'
         for show in config["shows"]:
-            show_key = show.lower()
+            norm_show = normalize_show_name(show)
             matched_title = None
-
-            # Find matching AniList entry (substring match)
+            best_score = 0.0
             for ani_title in anilist_progress:
-                if ani_title in show_key or show_key in ani_title:
+                score = similarity(norm_show, ani_title)
+                if score > best_score and score > 0.6:  # 🟩 fuzzy threshold
                     matched_title = ani_title
-                    break
+                    best_score = score
 
             if not matched_title:
-                print(f"⏭️ '{show}' is not in your AniList 'Watching' list, skipping.")
+                print(f"⏭️ '{show}' not found in AniList 'Watching', skipping.")
                 continue
 
             last_seen = anilist_progress[matched_title]
             print(f"\n📺 {matched_title}: Last watched episode {last_seen}")
 
-            # Build Nyaa query
             query = f"{show} {config['quality']} {config['codec']}"
-            results = asyncio.run(search_nyaa(query, allowed_groups=config.get("release_groups")))
+            results = await search_nyaa(query, allowed_groups=config.get("release_groups"))
 
-            # Filter to unwatched episodes only
+            # Filter unwatched episodes
             filtered_results = []
             for r in results:
                 ep_num = extract_episode_number(r["title"])
                 try:
-                    if ep_num and int(ep_num) > last_seen:
+                    if ep_num and int(re.sub(r'v\d', '', ep_num)) > last_seen:
                         filtered_results.append(r)
                 except ValueError:
                     pass
@@ -144,27 +136,35 @@ def main():
 
             print(f"🔍 Found {len(filtered_results)} new episode(s) for {show}")
 
-            # Process only filtered results
-            for r in filtered_results:
-                magnet = asyncio.run(extract_magnet(r["link"]))
-                if not magnet:
-                    print(f"⚠️ Magnet not found for {r['title']}")
+            # 🟩 Only add one (highest-priority) result
+            r = filtered_results[0]
+            magnet = await extract_magnet(r["link"])
+            if not magnet:
+                print(f"⚠️ Magnet not found for {r['title']}")
+                continue
+
+            if not args.non_interactive:
+                if not ask_user_to_accept(r["title"], magnet):
+                    print("⏭️ Skipped by user.")
                     continue
 
-                if interactive:
-                    if not ask_user_to_accept(r["title"], magnet):
-                        print("⏭️ Skipped by user.")
-                        continue
-
-                try:
-                    qb.add_magnet(magnet)
-                    print(f"✅ Sent {r['title']} to qBittorrent")
-                except Exception as e:
-                    print(f"❌ Failed to add {r['title']}: {e}")
+            try:
+                qb.add_magnet(magnet)
+                print(f"✅ Sent {r['title']} to qBittorrent")
+            except Exception as e:
+                print(f"❌ Failed to add {r['title']}: {e}")
 
     except Exception as e:
         logging.error(f"❌ Failed: {e}")
         return
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Torrent Automator Tool")
+    parser.add_argument("--config", type=str, required=True, help="Path to config.yaml")
+    parser.add_argument("--non-interactive", action="store_true", help="Auto-accept all matches")
+    args = parser.parse_args()
+    asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":
