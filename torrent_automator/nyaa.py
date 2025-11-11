@@ -2,10 +2,10 @@ import httpx
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 
-async def search_nyaa(query: str, allowed_groups=None, limit: int = 2):
+async def search_nyaa(query: str, allowed_groups=None, limit: int = 15):
     """
     Search Nyaa.si using its RSS feed and return a filtered list of torrents.
-    Only includes results from allowed_groups if provided.
+    Only includes results from allowed_groups if provided (prefix match like "[ASW] ...").
     """
     url = f"https://nyaa.si/?page=rss&q={query.replace(' ', '+')}"
 
@@ -17,40 +17,41 @@ async def search_nyaa(query: str, allowed_groups=None, limit: int = 2):
     results = []
 
     for item in root.findall("./channel/item"):
-        title = item.find("title").text
-        torrent_page_url = item.find("guid").text  # This is the view page, not .torrent
+        title_el = item.find("title")
+        guid_el = item.find("guid")
+        if title_el is None or guid_el is None:
+            continue
 
-        # ✅ Filter by allowed release groups
+        title = title_el.text or ""
+        torrent_page_url = guid_el.text or ""
+
+        # Filter by allowed release groups (if given)
         if allowed_groups:
-            if not any(title.startswith(f"[{group}]") for group in allowed_groups):
+            lowered = title.lower()
+            # accept if any priority group matches title prefix like: [group]
+            if not any(lowered.startswith(f"[{g.lower()}]") for g in allowed_groups):
                 continue
 
         results.append({
             "title": title,
-            "link": torrent_page_url  # 👈 this is the correct one to extract magnet from
+            "link": torrent_page_url
         })
 
         if len(results) >= limit:
             break
-    # ✅ Sort results by group priority
-    if allowed_groups:
-        results.sort(key=lambda r: score_result(r["title"], allowed_groups))
 
     return results
 
 
-
 def score_result(title: str, group_priority: list[str]) -> int:
     """
-    Give a higher score to torrents from higher-priority groups.
-    Lower score = better match (for sorting).
+    Lower score = higher priority. Unknown groups -> lowest priority.
     """
+    low = title.lower()
     for index, group in enumerate(group_priority):
-        if title.startswith(f"[{group}]"):
-            return index  # Lower index = higher priority
-    return len(group_priority)  # Lowest priority if group not found
-
-
+        if low.startswith(f"[{group.lower()}]"):
+            return index
+    return len(group_priority)
 
 
 async def extract_magnet(link: str) -> str | None:
@@ -67,7 +68,6 @@ async def extract_magnet(link: str) -> str | None:
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    # Find <a> tags where href starts with magnet:? and text contains 'Magnet'
     for a in soup.find_all("a", href=True):
         href = a["href"]
         text = a.get_text(strip=True).lower()

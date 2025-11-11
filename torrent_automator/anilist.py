@@ -3,7 +3,13 @@ import aiohttp
 async def fetch_anilist_progress(username: str) -> dict:
     """
     Fetch only the user's 'Watching' anime list from AniList.
-    Returns {title_lowercase: last_watched_episode}.
+    Returns a mapping:
+      {
+        title_lowercase: {
+          "progress": last_watched_episode (int),
+          "episodes": season_total_episodes (int | None)
+        }
+      }
     """
     print("📦 Running AniList 'Watching' fetch (aiohttp)")
 
@@ -24,7 +30,7 @@ async def fetch_anilist_progress(username: str) -> dict:
     """
 
     url = "https://graphql.anilist.co"
-    progress = {}
+    out: dict[str, dict] = {}
 
     async with aiohttp.ClientSession() as session:
         try:
@@ -40,6 +46,13 @@ async def fetch_anilist_progress(username: str) -> dict:
     lists = data.get("data", {}).get("MediaListCollection", {}).get("lists", [])
     for list_group in lists:
         for entry in list_group.get("entries", []):
-            title = entry["media"]["title"]["romaji"].lower()
-            progress[title] = entry["progress"]
-    return progress
+            media = entry.get("media", {}) or {}
+            title = (media.get("title", {}) or {}).get("romaji", "") or ""
+            progress = int(entry.get("progress") or 0)
+            episodes = media.get("episodes")
+            try:
+                episodes = int(episodes) if episodes is not None else None
+            except Exception:
+                episodes = None
+            out[title.lower()] = {"progress": progress, "episodes": episodes}
+    return out

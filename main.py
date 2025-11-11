@@ -1,79 +1,142 @@
 #!/usr/bin/env python3
 import sys
 from pathlib import Path
-
-# Add the current directory to the Python path
 sys.path.append(str(Path(__file__).parent))
 
 import argparse
 import logging
 import asyncio
 import re
-from difflib import SequenceMatcher  # 🟩 added
+from difflib import SequenceMatcher
 
 from torrent_automator.config import load_config
-from torrent_automator.nyaa import search_nyaa, extract_magnet
+from torrent_automator.nyaa import search_nyaa, extract_magnet, score_result
 from torrent_automator.qbittorrent import QBitClient
 from torrent_automator.anilist import fetch_anilist_progress
 
 
-def extract_episode_number(title: str) -> str | None:
-    """
-    Extract episode number from a torrent title.
-    Handles patterns like:
-    - S03E07
-    - - 07
-    - Ep 07
-    - Episode 07v2
-    Returns the episode as a string (e.g. "07" or "07v2").
-    """
-    patterns = [
-        r"[ _-][Ee][Pp]?\s?(\d{1,3}(?:v\d)?)",      # Ep 03, E03, - 03, etc.
-        r"[Ss]\d{1,2}[Ee](\d{1,3}(?:v\d)?)",         # S03E07 or S1E2
-        r"(?:Episode\s*)(\d{1,3}(?:v\d)?)",          # Episode 03
-        r"[ _-](\d{1,3}(?:v\d)?)"                    # fallback simple number
-    ]
+# ------------------------------
+# Parsing helpers
+# ------------------------------
 
+def extract_episode_number(title: str) -> str | None:
+    clean = (
+        title.replace("×", "x")
+             .replace("–", "-")
+             .replace("—", "-")
+             .replace("_", " ")
+    )
+    patterns = [
+        r"[Ss](\d{1,2})[Ee](\d{1,3}(?:v\d)?)",
+        r"[Ss]eason\s*\d{1,2}\s*[- ]\s*(\d{1,3}(?:v\d)?)",
+        r"[Ee]pisode\s*(\d{1,3}(?:v\d)?)",
+        r"[- ](\d{1,3}(?:v\d)?)",
+    ]
     for pat in patterns:
-        match = re.search(pat, title)
-        if match:
-            ep = match.group(1)
-            # 🟩 skip 720, 1080, 2160 numbers
+        m = re.search(pat, clean)
+        if m:
+            ep = m.group(2) if len(m.groups()) >= 2 else m.group(1)
             if ep in ("720", "1080", "2160"):
                 continue
             return ep.zfill(2)
     return None
 
 
+def extract_season_number(title: str) -> int | None:
+    m = re.search(r"[Ss](\d{1,2})", title) or re.search(r"[Ss]eason\s*(\d{1,2})", title)
+    return int(m.group(1)) if m else None
+
+
 def normalize_show_name(name: str) -> str:
-    """Simplify show names for consistent comparison (case-insensitive)."""
-    name = re.sub(r"\[.*?\]", "", name)
-    name = re.sub(r"\(.*?\)", "", name)  # 🟩 remove parentheses too
-    name = re.sub(r"[^a-zA-Z0-9\s]", "", name)  # 🟩 strip symbols
-    name = re.sub(r"\s+", " ", name)
-    return name.lower().strip()
+    s = name
+    s = s.replace("×", "x").replace("–", "-").replace("—", "-")
+    s = re.sub(r"[^\w\s-]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9\s-]", "", s)
+    s = re.sub(r"[-\s]+", " ", s)
+    return s
 
 
-def similarity(a: str, b: str) -> float:  # 🟩 added fuzzy matching helper
+def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def ask_user_to_accept(title: str, magnet: str) -> bool:
-    """Ask the user whether to accept this torrent for download."""
-    print("\n🔹 Torrent:")
-    print(f"Title : {title}")
-    print(f"Magnet: {magnet[:60]}...")
-    while True:
-        choice = input("Add this torrent to qBittorrent? [y/N]: ").strip().lower()
-        if choice in ("y", "yes"):
-            return True
-        elif choice in ("n", "no", ""):
-            return False
+# ------------------------------
+# Nyaa search helpers
+# ------------------------------
+
+def _safe_query_tokens(show: str, quality: str, codec: str) -> list[str]:
+    base = normalize_show_name(show)
+    tokens = [f"{base} {quality} {codec}"]
+    if " season " in f" {base} ":
+        head, tail = base.split(" season ", 1)
+        tokens.append(f"{base.replace(' season ', ' s ')} {quality} {codec}")
+        if tail.strip().isdigit():
+            n = tail.strip()
+            tokens.append(f"{head.strip()} s {n} {quality} {codec}")
+            tokens.append(f"{head.strip()} {n} {quality} {codec}")
+    else:
+        tokens.append(f"{base} {quality}")
+    seen, out = set(), []
+    for q in tokens:
+        if q not in seen:
+            seen.add(q)
+            out.append(q)
+    return out
+
+
+async def search_with_variants(show: str, config: dict):
+    queries = _safe_query_tokens(show, config["quality"], config["codec"])
+    seen_titles = set()
+    results = []
+    for q in queries:
+        r = await search_nyaa(q, allowed_groups=config.get("release_groups"))
+        for item in r:
+            t = item["title"]
+            if t not in seen_titles:
+                seen_titles.add(t)
+                results.append(item)
+    return results
+
+
+# ------------------------------
+# Deduplication by episode
+# ------------------------------
+
+def pick_best_per_episode(results: list[dict], groups: list[str], current_season: int) -> list[dict]:
+    bucket: dict[tuple[int, int], dict] = {}
+
+    for r in results:
+        ep_s = extract_episode_number(r["title"])
+        if not ep_s:
+            continue
+        try:
+            ep = int(re.sub(r"v\d", "", ep_s))
+        except Exception:
+            continue
+
+        sn = extract_season_number(r["title"]) or current_season  # ✅ force collapse
+        key = (sn, ep)
+
+        if key not in bucket:
+            bucket[key] = r
         else:
-            print("Please enter 'y' or 'n'.")
+            cur = bucket[key]
+            if groups:
+                cur_score = score_result(cur["title"], groups)
+                new_score = score_result(r["title"], groups)
+                if new_score < cur_score:
+                    bucket[key] = r
+
+    ordered = [bucket[k] for k in sorted(bucket.keys(), key=lambda k: (k[0], k[1]))]
+    return ordered
 
 
-# 🟩 fully async main to avoid repeated asyncio.run()
+# ------------------------------
+# Main flow
+# ------------------------------
+
 async def main_async(args):
     logging.basicConfig(level=logging.INFO)
 
@@ -91,78 +154,97 @@ async def main_async(args):
         )
         qb.login()
 
-        # 📡 AniList fetch
-        anilist_progress = {}
+        # AniList fetch
+        anilist = {}
         if "anilist_username" in config:
             logging.info("🔗 Fetching AniList 'Watching' list...")
-            anilist_progress = await fetch_anilist_progress(config["anilist_username"])
+            anilist = await fetch_anilist_progress(config["anilist_username"])
             print("📺 AniList Watching List:")
-            for title, ep in anilist_progress.items():
-                print(f"  {title} → Ep {ep}")
+            for title, info in anilist.items():
+                print(f"  {title} → Ep {info['progress']}")
 
         for show in config["shows"]:
             norm_show = normalize_show_name(show)
             matched_title = None
-            best_score = 0.0
-            for ani_title in anilist_progress:
+            best = 0.0
+            for ani_title in anilist:
                 score = similarity(norm_show, ani_title)
-                if score > best_score and score > 0.6:  # 🟩 fuzzy threshold
+                if score > best and score > 0.6:
                     matched_title = ani_title
-                    best_score = score
+                    best = score
 
             if not matched_title:
                 print(f"⏭️ '{show}' not found in AniList 'Watching', skipping.")
                 continue
 
-            last_seen = anilist_progress[matched_title]
-            print(f"\n📺 {matched_title}: Last watched episode {last_seen}")
+            prog = int(anilist[matched_title]["progress"])
+            season_total = anilist[matched_title]["episodes"]
+            current_season = extract_season_number(matched_title) or 1  # ✅ assume 1 if missing
 
-            query = f"{show} {config['quality']} {config['codec']}"
-            results = await search_nyaa(query, allowed_groups=config.get("release_groups"))
+            print(f"\n📺 {matched_title}: Last watched episode {prog}")
 
-            # Filter unwatched episodes
-            filtered_results = []
+            results = await search_with_variants(show, config)
+
+            # Filter results
+            filtered = []
             for r in results:
-                ep_num = extract_episode_number(r["title"])
+                ep_s = extract_episode_number(r["title"])
+                if not ep_s:
+                    continue
                 try:
-                    if ep_num and int(re.sub(r'v\d', '', ep_num)) > last_seen:
-                        filtered_results.append(r)
-                except ValueError:
-                    pass
+                    ep = int(re.sub(r"v\d", "", ep_s))
+                except Exception:
+                    continue
 
-            if not filtered_results:
+                sn = extract_season_number(r["title"]) or current_season
+                if current_season and sn != current_season:
+                    continue
+                if season_total is not None and ep > season_total:
+                    continue
+                if ep > prog:
+                    filtered.append(r)
+
+            if not filtered:
                 print(f"⏭️ No new episodes for {show}")
                 continue
 
-            print(f"🔍 Found {len(filtered_results)} new episode(s) for {show}")
+            groups = config.get("release_groups", []) or []
+            best_per_ep = pick_best_per_episode(filtered, groups, current_season)
 
-            # 🟩 Only add one (highest-priority) result
-            r = filtered_results[0]
-            magnet = await extract_magnet(r["link"])
-            if not magnet:
-                print(f"⚠️ Magnet not found for {r['title']}")
-                continue
-
-            if not args.non_interactive:
-                if not ask_user_to_accept(r["title"], magnet):
-                    print("⏭️ Skipped by user.")
+            for r in best_per_ep:
+                magnet = await extract_magnet(r["link"])
+                if not magnet:
+                    print(f"⚠️ Magnet not found for {r['title']}")
                     continue
 
-            try:
-                qb.add_magnet(magnet)
-                print(f"✅ Sent {r['title']} to qBittorrent")
-            except Exception as e:
-                print(f"❌ Failed to add {r['title']}: {e}")
+                # 🧠 Log which group was chosen
+                grp = re.search(r"^\[(.*?)\]", r["title"])
+                grp = grp.group(1) if grp else "Unknown"
+                print(f"✅ Chosen [{grp}] for episode {extract_episode_number(r['title'])}")
+
+                if not args.non_interactive:
+                    print("\n🔹 Torrent:")
+                    print(f"Title : {r['title']}")
+                    print(f"Magnet: {magnet[:60]}...")
+                    choice = input("Add this torrent to qBittorrent? [y/N]: ").strip().lower()
+                    if choice not in ("y", "yes"):
+                        print("⏭️ Skipped by user.")
+                        continue
+
+                try:
+                    qb.add_magnet(magnet)
+                    print(f"✅ Sent {r['title']} to qBittorrent")
+                except Exception as e:
+                    print(f"❌ Failed to add {r['title']}: {e}")
 
     except Exception as e:
         logging.error(f"❌ Failed: {e}")
-        return
 
 
 def main():
     parser = argparse.ArgumentParser(description="Torrent Automator Tool")
-    parser.add_argument("--config", type=str, required=True, help="Path to config.yaml")
-    parser.add_argument("--non-interactive", action="store_true", help="Auto-accept all matches")
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--non-interactive", action="store_true")
     args = parser.parse_args()
     asyncio.run(main_async(args))
 
