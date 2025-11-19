@@ -22,8 +22,7 @@ import yaml
 # ---- import from existing modules ----
 from torrent_automator.config import load_config
 from torrent_automator.anilist import fetch_anilist_progress
-from torrent_automator.qbittorrent import QBitClient
-from torrent_automator.nyaa import search_nyaa, extract_magnet
+from main import run_automation
 
 # ---------------------------------------------------------------------
 # Helpers & persistent prefs
@@ -93,36 +92,15 @@ class AutomationWorker(QRunnable):
         asyncio.run(self._run())
     async def _run(self):
         try:
-            qb_cfg = self.config.get("qbittorrent", {})
-            qb = QBitClient(
-                host=qb_cfg.get("host"),
-                port=qb_cfg.get("port"),
-                username=qb_cfg.get("username"),
-                password=qb_cfg.get("password"),
-                use_https=qb_cfg.get("https", False),
+            await run_automation(
+                config=self.config,
+                non_interactive=True,
+                log_cb=self.signals.line.emit,
             )
-            qb.login()
-            shows = self.config.get("shows", [])
-            groups = self.config.get("release_groups") or []
-            preferred = self.config.get("preferred_group") or ""
-            # If single-group mode was chosen, narrow to that one group only
-            allowed_groups = [preferred] if preferred else (groups or None)
-
-            for show in shows:
-                self.signals.line.emit(f"🔎 Searching for {show} ...")
-                results = await search_nyaa(show, allowed_groups)
-                if not results:
-                    self.signals.line.emit(f"⚠️ No results for {show}")
-                    continue
-                first = results[0]
-                magnet = await extract_magnet(first["link"])
-                if magnet:
-                    qb.add_magnet(magnet)
-                    self.signals.line.emit(f"✅ Added {first['title']}")
-                await asyncio.sleep(0.2)
         except Exception as e:
             self.signals.line.emit(f"❌ Error: {e}")
-        self.signals.done.emit()
+        finally:
+            self.signals.done.emit()
 
 # ---------------------------------------------------------------------
 # Group Reorder Dialog (drag & drop)

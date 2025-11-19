@@ -8,6 +8,7 @@ import logging
 import asyncio
 import re
 from difflib import SequenceMatcher
+from typing import Callable
 
 from torrent_automator.config import load_config
 from torrent_automator.nyaa import search_nyaa, extract_magnet, score_result
@@ -137,11 +138,16 @@ def pick_best_per_episode(results: list[dict], groups: list[str], current_season
 # Main flow
 # ------------------------------
 
-async def main_async(args):
-    logging.basicConfig(level=logging.INFO)
+LogFn = Callable[[str], None] | None
+
+async def run_automation(config: dict, non_interactive: bool = False, log_cb: LogFn = None):
+    def emit(message: str):
+        if log_cb:
+            log_cb(message)
+        else:
+            print(message)
 
     try:
-        config = load_config(args.config)
         logging.info("✅ Config loaded successfully!")
         logging.info(f"Shows from config: {config['shows']}")
 
@@ -159,9 +165,9 @@ async def main_async(args):
         if "anilist_username" in config:
             logging.info("🔗 Fetching AniList 'Watching' list...")
             anilist = await fetch_anilist_progress(config["anilist_username"])
-            print("📺 AniList Watching List:")
+            emit("📺 AniList Watching List:")
             for title, info in anilist.items():
-                print(f"  {title} → Ep {info['progress']}")
+                emit(f"  {title} → Ep {info['progress']}")
 
         for show in config["shows"]:
             norm_show = normalize_show_name(show)
@@ -174,14 +180,14 @@ async def main_async(args):
                     best = score
 
             if not matched_title:
-                print(f"⏭️ '{show}' not found in AniList 'Watching', skipping.")
+                emit(f"⏭️ '{show}' not found in AniList 'Watching', skipping.")
                 continue
 
             prog = int(anilist[matched_title]["progress"])
             season_total = anilist[matched_title]["episodes"]
             current_season = extract_season_number(matched_title) or 1  # ✅ assume 1 if missing
 
-            print(f"\n📺 {matched_title}: Last watched episode {prog}")
+            emit(f"\n📺 {matched_title}: Last watched episode {prog}")
 
             results = await search_with_variants(show, config)
 
@@ -205,7 +211,7 @@ async def main_async(args):
                     filtered.append(r)
 
             if not filtered:
-                print(f"⏭️ No new episodes for {show}")
+                emit(f"⏭️ No new episodes for {show}")
                 continue
 
             groups = config.get("release_groups", []) or []
@@ -214,28 +220,28 @@ async def main_async(args):
             for r in best_per_ep:
                 magnet = await extract_magnet(r["link"])
                 if not magnet:
-                    print(f"⚠️ Magnet not found for {r['title']}")
+                    emit(f"⚠️ Magnet not found for {r['title']}")
                     continue
 
                 # 🧠 Log which group was chosen
                 grp = re.search(r"^\[(.*?)\]", r["title"])
                 grp = grp.group(1) if grp else "Unknown"
-                print(f"✅ Chosen [{grp}] for episode {extract_episode_number(r['title'])}")
+                emit(f"✅ Chosen [{grp}] for episode {extract_episode_number(r['title'])}")
 
-                if not args.non_interactive:
-                    print("\n🔹 Torrent:")
-                    print(f"Title : {r['title']}")
-                    print(f"Magnet: {magnet[:60]}...")
+                if not non_interactive:
+                    emit("\n🔹 Torrent:")
+                    emit(f"Title : {r['title']}")
+                    emit(f"Magnet: {magnet[:60]}...")
                     choice = input("Add this torrent to qBittorrent? [y/N]: ").strip().lower()
                     if choice not in ("y", "yes"):
-                        print("⏭️ Skipped by user.")
+                        emit("⏭️ Skipped by user.")
                         continue
 
                 try:
                     qb.add_magnet(magnet)
-                    print(f"✅ Sent {r['title']} to qBittorrent")
+                    emit(f"✅ Sent {r['title']} to qBittorrent")
                 except Exception as e:
-                    print(f"❌ Failed to add {r['title']}: {e}")
+                    emit(f"❌ Failed to add {r['title']}: {e}")
 
     except Exception as e:
         logging.error(f"❌ Failed: {e}")
@@ -246,7 +252,9 @@ def main():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--non-interactive", action="store_true")
     args = parser.parse_args()
-    asyncio.run(main_async(args))
+    logging.basicConfig(level=logging.INFO)
+    config = load_config(args.config)
+    asyncio.run(run_automation(config, non_interactive=args.non_interactive))
 
 
 if __name__ == "__main__":
