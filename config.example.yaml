@@ -1,0 +1,16 @@
+anilist_username: ""
+shows: []
+
+quality: "1080p"
+codec: "HEVC"
+
+qbittorrent:
+  host: "localhost"
+  port: 8080
+  username: ""
+  password: ""
+  https: false
+
+# optional for GUI
+preferred_group: ""
+release_groups: []
