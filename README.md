@@ -1,5 +1,5 @@
 
-#### <p style="text-align:center;">A tool that fetches new episodes from Nyaa, matches them to theuser’s AniList “Watching” list, and sends the prefered release to qBittorrent.</p>
+#### <p style="text-align:center;">A tool that fetches new episodes from Nyaa, matches them to the user’s AniList “Watching” list, and sends the prefered release to qBittorrent.</p>
 
 
 ## Features
@@ -15,9 +15,11 @@
 
 ## Installation
 
+	python -m venv venv
+	venv\Scripts\activate
 	python -m pip install -r requirements.txt
 
-Requires Python 3.10+ and a running qBittorrent WebUI instance.
+Requires Python 3.10+ and qBittorrent WebUI.
 
   
 
@@ -53,4 +55,12 @@ The GUI supports:
 - Fetching AniList shows.
 - Selecting shows to add to config.
 - Defining release groups and priority.
+- Opening qBittorrent in WebUI.
 - Running automation with real-time logs.
+
+### To-Do
+
+- Refine GUI layout and remove unused or redundant elements.
+- Add support for fetching the last N releases for a selected group + show.
+- Improve episode filtering to cover additional irregular naming edge cases.
+- Create a standalone executable build for the GUI.
