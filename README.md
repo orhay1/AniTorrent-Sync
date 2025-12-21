@@ -9,6 +9,8 @@ A tool that fetches new episodes from Nyaa, matches them to the user's AniList *
 - Automatically select the best release per episode
 - Auto-enqueue torrents to the qBittorrent WebUI
 - Configure release groups, quality/codec, and AniList integration
+- Fetch recent releases for one or more shows (optional episode filter)
+- Built-in popular release group list
 - Use the modern GUI to view logs, tweak preferences, and reorder groups
 
 ## Installation
@@ -69,12 +71,14 @@ The GUI supports:
 - Fetching AniList shows
 - Selecting shows to add to the config
 - Defining release groups and priority
-- Opening qBittorrent in the WebUI
-- Running automation with real-time logs
+- Batch automation with real-time logs
+- Recent releases tab (multi-show, group, count, quality/codec override, optional episode)
+- Load popular release groups into the picker
+- Save/reload config from the menu
+- Open qBittorrent (WebUI or app)
 
 ## To-Do
 
 - Refine the GUI layout and remove unused or redundant elements
-- Add support for fetching the last N releases for a selected group + show
 - Improve episode filtering to cover additional irregular naming edge cases
 - Create a standalone executable build for the GUI

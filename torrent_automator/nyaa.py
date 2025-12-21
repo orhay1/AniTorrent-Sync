@@ -1,5 +1,7 @@
 import httpx
 import xml.etree.ElementTree as ET
+import re
+from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
 
 async def search_nyaa(query: str, allowed_groups=None, limit: int = 15):
@@ -76,3 +78,35 @@ async def extract_magnet(link: str) -> str | None:
 
     print("⚠️ Magnet link not found in HTML.")
     return None
+
+
+async def fetch_nyaa_groups(query: str = "1080p", pages: int = 5, max_groups: int = 150) -> list[str]:
+    """
+    Scrape Nyaa search pages and extract distinct release group names from titles.
+    """
+    groups: list[str] = []
+    seen = set()
+
+    async with httpx.AsyncClient() as client:
+        for page in range(1, max(1, pages) + 1):
+            url = f"https://nyaa.si/?q={quote_plus(query)}&p={page}"
+            response = await client.get(url)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            for row in soup.select("table.torrent-list tbody tr"):
+                title_link = row.select_one("td.col-2 a[href^='/view/']")
+                if not title_link:
+                    continue
+                title = title_link.get_text(strip=True)
+                m = re.match(r"^\[(.*?)\]", title)
+                if not m:
+                    continue
+                group = m.group(1).strip()
+                if group and group not in seen:
+                    seen.add(group)
+                    groups.append(group)
+                    if len(groups) >= max_groups:
+                        return groups
+
+    return groups

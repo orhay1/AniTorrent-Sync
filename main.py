@@ -59,6 +59,15 @@ def normalize_show_name(name: str) -> str:
     return s
 
 
+def normalize_group_name(group: str) -> str:
+    g = (group or "").strip()
+    if g.lower() in ("any", "(any)"):
+        return ""
+    if g.startswith("[") and g.endswith("]"):
+        g = g[1:-1].strip()
+    return g
+
+
 def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
@@ -69,22 +78,34 @@ def similarity(a: str, b: str) -> float:
 
 def _safe_query_tokens(show: str, quality: str, codec: str) -> list[str]:
     base = normalize_show_name(show)
-    tokens = [f"{base} {quality} {codec}"]
+    def join_parts(*parts: str) -> str:
+        return " ".join(p for p in parts if p).strip()
+
+    tokens = [join_parts(base, quality, codec)]
     if " season " in f" {base} ":
         head, tail = base.split(" season ", 1)
-        tokens.append(f"{base.replace(' season ', ' s ')} {quality} {codec}")
+        tokens.append(join_parts(base.replace(" season ", " s "), quality, codec))
         if tail.strip().isdigit():
             n = tail.strip()
-            tokens.append(f"{head.strip()} s {n} {quality} {codec}")
-            tokens.append(f"{head.strip()} {n} {quality} {codec}")
+            tokens.append(join_parts(head.strip(), "s", n, quality, codec))
+            tokens.append(join_parts(head.strip(), n, quality, codec))
     else:
-        tokens.append(f"{base} {quality}")
+        tokens.append(join_parts(base, quality))
     seen, out = set(), []
     for q in tokens:
-        if q not in seen:
+        if q and q not in seen:
             seen.add(q)
             out.append(q)
     return out
+
+
+def _recent_query(show: str, quality: str, codec: str) -> str:
+    parts = [show]
+    if quality:
+        parts.append(quality)
+    if codec:
+        parts.append(codec)
+    return " ".join(p.strip() for p in parts if p and p.strip())
 
 
 async def search_with_variants(show: str, config: dict):
@@ -247,14 +268,154 @@ async def run_automation(config: dict, non_interactive: bool = False, log_cb: Lo
         logging.error(f"❌ Failed: {e}")
 
 
+def _split_shows(value) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        out = []
+        for v in value:
+            out.extend(_split_shows(v))
+        return out
+    if isinstance(value, str):
+        parts = [v.strip() for v in value.split(",")]
+        return [p for p in parts if p]
+    return []
+
+
+def _normalize_episode_input(value: str | None) -> str | None:
+    if not value:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    if v.isdigit():
+        return v.zfill(2)
+    return v
+
+
+async def run_recent_fetch(
+    config: dict,
+    show: str | list[str] | None = None,
+    group: str | None = None,
+    count: int | None = None,
+    non_interactive: bool = False,
+    log_cb: LogFn = None,
+    quality: str | None = None,
+    codec: str | None = None,
+    episode: str | None = None,
+):
+    def emit(message: str):
+        if log_cb:
+            log_cb(message)
+        else:
+            print(message)
+
+    try:
+        show_list = _split_shows(show)
+        if not show_list:
+            show_list = _split_shows(config.get("recent_shows")) or _split_shows(config.get("recent_show"))
+
+        group = normalize_group_name(group or config.get("recent_group") or config.get("preferred_group") or "")
+        count = count or config.get("recent_count") or 5
+
+        if not show_list:
+            emit("Missing recent show(s). Set recent_shows in config or pass CLI args.")
+            return
+
+        recent_quality = (config.get("recent_quality") or "").strip()
+        recent_codec = (config.get("recent_codec") or "").strip()
+        if recent_quality == "__any__":
+            quality = ""
+        else:
+            quality = (quality or recent_quality or config.get("quality") or "").strip()
+        if recent_codec == "__any__":
+            codec = ""
+        else:
+            codec = (codec or recent_codec or config.get("codec") or "").strip()
+        episode_filter = _normalize_episode_input(episode or config.get("recent_episode"))
+
+        qb = None
+        def ensure_qb():
+            nonlocal qb
+            if qb is None:
+                qb = QBitClient(
+                    host=config["qbittorrent"]["host"],
+                    port=config["qbittorrent"]["port"],
+                    username=config["qbittorrent"]["username"],
+                    password=config["qbittorrent"]["password"],
+                    use_https=config["qbittorrent"].get("https", False)
+                )
+                qb.login()
+
+        for show_name in show_list:
+            query = _recent_query(show_name, quality, codec)
+            label = f"[{group}] " if group else ""
+            emit(f"Fetching last {count} releases for {label}{show_name}...")
+            results = await search_nyaa(query, allowed_groups=[group] if group else None, limit=int(count))
+            if episode_filter:
+                results = [r for r in results if extract_episode_number(r["title"]) == episode_filter]
+
+            if not results:
+                emit(f"No recent releases found for {show_name}.")
+                continue
+
+            emit("Recent releases:")
+            for i, r in enumerate(results, start=1):
+                emit(f"{i}. {r['title']}")
+
+            for r in results:
+                magnet = await extract_magnet(r["link"])
+                if not magnet:
+                    emit(f"Magnet not found for {r['title']}")
+                    continue
+
+                if not non_interactive:
+                    emit("\nTorrent:")
+                    emit(f"Title : {r['title']}")
+                    emit(f"Magnet: {magnet[:60]}...")
+                    choice = input("Add this torrent to qBittorrent? [y/N]: ").strip().lower()
+                    if choice not in ("y", "yes"):
+                        emit("Skipped by user.")
+                        continue
+
+                try:
+                    ensure_qb()
+                    qb.add_magnet(magnet)
+                    emit(f"Sent {r['title']} to qBittorrent")
+                except Exception as e:
+                    emit(f"Failed to add {r['title']}: {e}")
+
+    except Exception as e:
+        logging.error(f"Recent fetch failed: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Torrent Automator Tool")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--non-interactive", action="store_true")
+    parser.add_argument("--recent", action="store_true", help="Fetch last N releases for a show and group")
+    parser.add_argument("--recent-show", action="append", help="Show name for recent fetch (repeatable)")
+    parser.add_argument("--recent-group", type=str, help="Release group name for recent fetch")
+    parser.add_argument("--recent-count", type=int, help="Number of recent releases to fetch")
+    parser.add_argument("--recent-quality", type=str, help="Quality override for recent fetch")
+    parser.add_argument("--recent-codec", type=str, help="Codec override for recent fetch")
+    parser.add_argument("--recent-episode", type=str, help="Episode number filter for recent fetch")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     config = load_config(args.config)
-    asyncio.run(run_automation(config, non_interactive=args.non_interactive))
+    if args.recent:
+        asyncio.run(run_recent_fetch(
+            config=config,
+            show=args.recent_show,
+            group=args.recent_group,
+            count=args.recent_count,
+            non_interactive=args.non_interactive,
+            quality=args.recent_quality,
+            codec=args.recent_codec,
+            episode=args.recent_episode,
+        ))
+    else:
+        asyncio.run(run_automation(config, non_interactive=args.non_interactive))
 
 
 if __name__ == "__main__":

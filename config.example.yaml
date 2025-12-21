@@ -14,3 +14,12 @@ qbittorrent:
 # optional for GUI
 preferred_group: ""
 release_groups: []
+
+# recent releases fetch (optional)
+recent_show: ""
+recent_shows: []
+recent_group: ""
+recent_count: 5
+recent_quality: ""
+recent_codec: ""
+recent_episode: ""
