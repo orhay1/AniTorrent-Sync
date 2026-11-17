@@ -21,7 +21,7 @@ from PyQt6.QtCore import Qt, QThreadPool
 import yaml
 
 # ---- import from existing modules ----
-from torrent_automator.config import load_config
+from torrent_automator.config import load_config_with_report, default_config
 from torrent_automator.anilist import (
     fetch_anilist_progress, search_anilist, progress_bucket,
     BUCKET_BEHIND, BUCKET_FINISHED, BUCKET_CAUGHT_UP,
@@ -688,12 +688,21 @@ class TorrentAutomatorGUI(QMainWindow):
     # Config load/save
     # -----------------------------------------------------------------
     def _load_config(self):
+        added: List[str] = []
+        new_file = False
         try:
-            self.config = load_config(str(self.config_path))
+            self.config, added = load_config_with_report(str(self.config_path))
+        except FileNotFoundError:
+            # First run: start from the defaults so "Save config" writes a complete file.
+            self.config = default_config()
+            new_file = True
         except Exception as e:
             self._log(f"❌ Failed to load config: {e}")
-            self.config = {}
-            self._status("Could not load config.yaml (copy config.example.yaml to config.yaml)")
+            self.config = default_config()
+            self._status("config.yaml could not be read; fix or delete it (see log)")
+            QMessageBox.warning(self, "Config error",
+                                f"config.yaml could not be read:\n{e}\n\n"
+                                "Fix the file, or delete it and the app will start with defaults.")
             return
 
         self.user_edit.setText(self.config.get("anilist_username", ""))
@@ -742,11 +751,20 @@ class TorrentAutomatorGUI(QMainWindow):
         self.recent_episode_edit.setText((self.config.get("recent_episode") or "").strip())
 
         self.config_dirty = False
-        self._update_dirty_ui()
         self._update_group_summary()
         self._update_recent_summary()
-        self._status("Config loaded")
-        self._log("✅ Config loaded")
+        if new_file:
+            self._status("No config.yaml yet: using defaults. Press Save config to create it.")
+            self._log("ℹ️ No config.yaml found; started with defaults (Save config creates it)")
+            self.config_dirty = True
+        elif added:
+            self._status("Config loaded; missing settings were filled with defaults (Save config to keep them)")
+            self._log("⚠️ config.yaml was missing: " + ", ".join(added) + ". Using defaults; Save config to write them.")
+            self.config_dirty = True
+        else:
+            self._status("Config loaded")
+            self._log("✅ Config loaded")
+        self._update_dirty_ui()
 
     def _save_config(self, save_to_disk: bool = True):
         self.config["anilist_username"] = self.user_edit.text().strip()
