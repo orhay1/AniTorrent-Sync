@@ -50,7 +50,7 @@ class ConfirmDownloadDialog(QDialog):
         title = QLabel("Review before downloading")
         title.setObjectName("SectionTitle")
         v.addWidget(title)
-        kind = "Batch automation (new episodes after your AniList progress)" if plan.kind == "batch" \
+        kind = "Download basket (new episodes after your AniList progress)" if plan.kind == "batch" \
             else "Recent releases"
         sub = QLabel(f"{kind}. Nothing has been sent to qBittorrent yet. Untick anything you don't want.")
         sub.setObjectName("Muted")

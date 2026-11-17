@@ -146,6 +146,42 @@ class GuiTests(unittest.TestCase):
         self.assertIn("10 left", self.gui.progress_label(data["done airing"]))
 
 
+    def test_click_cover_toggles_basket(self):
+        base = {"cover": "", "color": "", "format": "TV", "status": "RELEASING"}
+        data = {
+            "frieren": dict(base, title="Frieren", progress=3, episodes=28, aired=6),
+            "other show": dict(base, title="Other Show", progress=2, episodes=12, aired=5),
+        }
+        self.w.config["shows"] = []
+        self.w._on_anilist(data)
+        self.assertFalse(self.w.run_btn.isEnabled())          # empty basket: nothing to download
+        self.assertTrue(self.w.basket_empty.isVisibleTo(self.w))
+        grid = self.w.anilist_grid.sections["behind"]["grid"]
+        frieren = next(it for it in grid.items() if it.data(gui_role_title()) == "Frieren")
+        grid._toggle(frieren)                                  # click
+        self.assertEqual(self.w.config["shows"], ["Frieren"])
+        self.assertTrue(self.w.run_btn.isEnabled())
+        self.assertIn("(1)", self.w.run_btn.text())
+        grid._toggle(frieren)                                  # click again
+        self.assertEqual(self.w.config["shows"], [])
+        # removing from the basket list un-ticks the cover
+        grid._toggle(frieren)
+        self.w.shows_list.item(0).setSelected(True)
+        self.w._remove_selected_shows()
+        self.assertEqual(frieren.checkState(), Qt.CheckState.Unchecked)
+        # Add all puts every visible show in the basket
+        self.w.anilist_grid.set_all_checked(True)
+        self.assertEqual(self.w.config["shows"], ["Frieren", "Other Show"])
+
+    def test_basket_shows_marked_on_fetch(self):
+        self.w.config["shows"] = ["Frieren"]
+        base = {"cover": "", "color": "", "format": "TV", "status": "RELEASING"}
+        self.w._on_anilist({"frieren": dict(base, title="Frieren", progress=3, episodes=28, aired=6),
+                            "other": dict(base, title="Other", progress=1, episodes=12, aired=1)})
+        checked = [it.data(gui_role_title()) for it in self.w.anilist_grid.checked_items()]
+        self.assertEqual(checked, ["Frieren"])
+
+
 def gui_role_title():
     from torrent_automator.ui.widgets import ROLE_TITLE
     return ROLE_TITLE

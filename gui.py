@@ -306,29 +306,33 @@ class TorrentAutomatorGUI(QMainWindow):
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setChildrenCollapsible(False)
 
-        # --- left: my shows ---
+        # --- left: download basket (config "shows") ---
         left, ll = card()
         head = QHBoxLayout()
-        self.my_shows_title = QLabel("My shows")
+        self.my_shows_title = QLabel("Download basket")
         self.my_shows_title.setObjectName("SectionTitle")
         head.addWidget(self.my_shows_title)
         head.addStretch()
         ll.addLayout(head)
-        ll.addWidget(hint("Shows the batch automation checks for new episodes."))
+        ll.addWidget(hint("Click covers on the right to add or remove shows. "
+                          "Only shows in the basket are downloaded."))
         self.shows_list = ThumbList()
-        self.shows_list.setToolTip("Configured shows. Select and press Delete or 'Remove' to drop them.")
+        self.shows_list.setToolTip("Shows to download. Select and press Delete or 'Remove' to take them out.")
         ll.addWidget(self.shows_list, 1)
+        self.basket_empty = hint("Your basket is empty.\nClick a cover to add it.")
+        self.basket_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ll.addWidget(self.basket_empty, 1)  # takes the list's space while the basket is empty
         brow = QHBoxLayout()
-        browse_btn = QPushButton("Browse AniList…")
+        browse_btn = QPushButton("Add from AniList search…")
         ll.addWidget(browse_btn)
-        browse_btn.setToolTip("Search AniList and add shows with their covers.")
+        browse_btn.setToolTip("Search AniList for a show that isn't on your Watching list.")
         browse_btn.clicked.connect(self._browse_for_config)
         rem_btn = QPushButton("Remove")
-        rem_btn.setToolTip("Remove the selected shows from the config.")
+        rem_btn.setToolTip("Take the selected shows out of the basket.")
         rem_btn.clicked.connect(self._remove_selected_shows)
-        clear_btn = QPushButton("Clear all")
+        clear_btn = QPushButton("Empty basket")
         clear_btn.setObjectName("Danger")
-        clear_btn.setToolTip("Remove every show from the config.")
+        clear_btn.setToolTip("Take every show out of the basket.")
         clear_btn.clicked.connect(self._clear_shows)
         brow.addWidget(rem_btn)
         brow.addStretch()
@@ -362,30 +366,27 @@ class TorrentAutomatorGUI(QMainWindow):
         self.anilist_filter.setClearButtonEnabled(True)
         self.anilist_filter.setMaximumWidth(260)
         self.anilist_filter.textChanged.connect(lambda t: self.anilist_grid.filter(t))
-        sel_all = QPushButton("Select all")
+        sel_all = QPushButton("Add all to basket")
         sel_all.setObjectName("Flat")
+        sel_all.setToolTip("Add every show shown below to the basket.")
         sel_all.clicked.connect(lambda: self.anilist_grid.set_all_checked(True))
-        sel_none = QPushButton("Select none")
+        sel_none = QPushButton("Remove all")
         sel_none.setObjectName("Flat")
+        sel_none.setToolTip("Take every show shown below out of the basket.")
         sel_none.clicked.connect(lambda: self.anilist_grid.set_all_checked(False))
-        self.add_selected = QPushButton("Add to my shows")
-        self.add_selected.setToolTip("Add the selected AniList shows to the config.")
-        self.add_selected.setEnabled(False)
-        self.add_selected.clicked.connect(self._add_selected)
         tools.addWidget(self.anilist_filter)
+        tools.addStretch()
         tools.addWidget(sel_all)
         tools.addWidget(sel_none)
-        tools.addStretch()
-        tools.addWidget(self.add_selected)
         rl.addLayout(tools)
 
         self.anilist_grid = GroupedCoverGrid([
             (BUCKET_BEHIND, "Behind", "Aired episodes you haven't watched yet"),
             (BUCKET_FINISHED, "Finished airing", "The whole season is out, you haven't finished it"),
             (BUCKET_CAUGHT_UP, "Up to date", "You've watched everything that has aired"),
-        ], card_width=138)
-        self.anilist_grid.setToolTip("Click covers to select shows, then 'Add to my shows'.")
-        self.anilist_grid.checkedChanged.connect(self._update_add_btn)
+        ], card_width=138, select_all_text="Add all")
+        self.anilist_grid.setToolTip("Click a cover to add it to (or remove it from) the download basket.")
+        self.anilist_grid.checkedChanged.connect(self._sync_basket_from_grid)
         rl.addWidget(self.anilist_grid, 1)
         self.anilist_empty = hint("Enter your AniList username above and press “Fetch AniList” to load "
                                   "your Watching list with covers.")
@@ -402,7 +403,7 @@ class TorrentAutomatorGUI(QMainWindow):
         row = QHBoxLayout()
         col = QVBoxLayout()
         col.setSpacing(2)
-        lab = QLabel("Batch automation")
+        lab = QLabel("Download basket")
         lab.setStyleSheet("font-weight: 600;")
         self.batch_summary = QLabel("")
         self.batch_summary.setObjectName("Muted")
@@ -412,9 +413,10 @@ class TorrentAutomatorGUI(QMainWindow):
         self.status_batch = QLabel("Idle")
         self.status_batch.setObjectName("Muted")
         row.addWidget(self.status_batch)
-        self.run_btn = QPushButton("Check for new episodes…")
+        self.run_btn = QPushButton("Download basket…")
         self.run_btn.setObjectName("Primary")
-        self.run_btn.setToolTip("Find new episodes for your shows. You'll review everything before it downloads.")
+        self.run_btn.setToolTip("Find the new episodes for every show in the basket. "
+                                "You'll review everything before it downloads.")
         self.run_btn.clicked.connect(self._run_automation)
         row.addWidget(self.run_btn)
         bl.addLayout(row)
@@ -442,7 +444,7 @@ class TorrentAutomatorGUI(QMainWindow):
         sl.addWidget(self.recent_show_list, 1)
 
         src = QHBoxLayout()
-        self.recent_use_config = QPushButton("From my shows")
+        self.recent_use_config = QPushButton("From basket")
         self.recent_use_config.setToolTip("Populate the list with shows from your config.")
         self.recent_use_config.clicked.connect(lambda: self._set_recent_shows(self.config.get("shows", []), checked=True))
         self.recent_use_anilist = QPushButton("From AniList")
@@ -845,7 +847,12 @@ class TorrentAutomatorGUI(QMainWindow):
             elif s.lower() in watching:
                 sub = progress_label(self._anilist_info(s), short=True)
             self.shows_list.add_show(s, s, sub, m.get("cover", ""), m.get("color", ""))
-        self.my_shows_title.setText(f"My shows ({len(shows)})")
+        self.my_shows_title.setText(f"Download basket ({len(shows)})" if shows else "Download basket")
+        self.basket_empty.setVisible(not shows)
+        self.shows_list.setVisible(bool(shows))
+        if not self.busy:
+            self.run_btn.setEnabled(bool(shows))
+        self.run_btn.setText(f"Download basket ({len(shows)})…" if shows else "Download basket…")
         self._update_batch_summary()
         self._refresh_badges()
 
@@ -860,8 +867,37 @@ class TorrentAutomatorGUI(QMainWindow):
             return
         shows = {s.lower() for s in self.config.get("shows", []) or []}
         for it in self.anilist_grid.items():
-            it.setData(Qt.ItemDataRole.UserRole + 5, "In my shows" if (it.data(ROLE_KEY) or "").lower() in shows else "")
+            in_basket = (it.data(ROLE_KEY) or "").lower() in shows
+            it.setCheckState(Qt.CheckState.Checked if in_basket else Qt.CheckState.Unchecked)
         self.anilist_grid.refresh()
+
+    def _sync_basket_from_grid(self):
+        """A cover was clicked (or Add all / Remove all): mirror the grid's ticks into the basket."""
+        shows = list(self.config.get("shows", []) or [])
+        lower = {s.lower() for s in shows}
+        added, removed = [], []
+        for it in self.anilist_grid.items():
+            key = it.data(ROLE_KEY) or ""
+            checked = it.checkState() == Qt.CheckState.Checked
+            if checked and key.lower() not in lower:
+                shows.append(key)
+                lower.add(key.lower())
+                added.append(key)
+            elif not checked and key.lower() in lower:
+                shows = [s for s in shows if s.lower() != key.lower()]
+                lower.discard(key.lower())
+                removed.append(key)
+        if not added and not removed:
+            return
+        self.config["shows"] = sorted(shows, key=str.lower)
+        self._refresh_shows_list()
+        self._mark_dirty()
+        if len(added) == 1 and not removed:
+            self._status(f"Added {added[0]} to the basket")
+        elif len(removed) == 1 and not added:
+            self._status(f"Removed {removed[0]} from the basket")
+        else:
+            self._status(f"Basket: {len(self.config['shows'])} show(s)")
 
     # -----------------------------------------------------------------
     # AniList + shows
@@ -908,14 +944,8 @@ class TorrentAutomatorGUI(QMainWindow):
             self.anilist_empty.setText("No shows found. Check the username, and that the list is public "
                                        "and has shows marked as Watching.")
         self._refresh_shows_list()
-        self._update_add_btn()
         self._status(f"Fetched {len(data)} titles from AniList")
         self._log(f"✅ Fetched {len(data)} AniList titles")
-
-    def _update_add_btn(self):
-        n = len(self.anilist_grid.checked_items())
-        self.add_selected.setEnabled(n > 0)
-        self.add_selected.setText(f"Add {n} to my shows" if n else "Add to my shows")
 
     def _add_shows(self, names: List[str]) -> int:
         shows = list(self.config.get("shows", []) or [])
@@ -932,13 +962,6 @@ class TorrentAutomatorGUI(QMainWindow):
             self._mark_dirty()
         return added
 
-    def _add_selected(self):
-        names = [it.data(ROLE_KEY) for it in self.anilist_grid.checked_items()]
-        added = self._add_shows(names)
-        self.anilist_grid.set_all_checked(False, visible_only=False)
-        self._log(f"➕ Added {added} show(s) ({len(self.config['shows'])} total)")
-        self._status(f"Added {added} show(s) to My shows (not saved yet)")
-
     def _browse_dialog(self, title: str, note: str, existing: set) -> List[dict]:
         dlg = AniListBrowseDialog(self, search_fn=search_anilist, title=title, note=note,
                                   existing=existing, key_fn=pretty_title)
@@ -951,7 +974,7 @@ class TorrentAutomatorGUI(QMainWindow):
         return picked
 
     def _browse_for_config(self):
-        picked = self._browse_dialog("Add shows to My shows", BATCH_NOTE,
+        picked = self._browse_dialog("Add shows to the download basket", BATCH_NOTE,
                                      set(self.config.get("shows", []) or []))
         if not picked:
             return
@@ -975,7 +998,7 @@ class TorrentAutomatorGUI(QMainWindow):
     def _remove_selected_shows(self):
         sel = [it.data(ROLE_KEY) for it in self.shows_list.selectedItems()]
         if not sel:
-            self._status("Select shows in My shows to remove them")
+            self._status("Select shows in the basket to remove them")
             return
         self.config["shows"] = [s for s in self.config.get("shows", []) if s not in sel]
         self._refresh_shows_list()
@@ -985,8 +1008,8 @@ class TorrentAutomatorGUI(QMainWindow):
     def _clear_shows(self):
         if not self.config.get("shows"):
             return
-        res = QMessageBox.question(self, "Clear all shows",
-                                   f"Remove all {len(self.config['shows'])} shows from My shows?")
+        res = QMessageBox.question(self, "Empty basket",
+                                   f"Take all {len(self.config['shows'])} shows out of the download basket?")
         if res != QMessageBox.StandardButton.Yes:
             return
         self.config["shows"] = []
@@ -1145,7 +1168,7 @@ class TorrentAutomatorGUI(QMainWindow):
     # -----------------------------------------------------------------
     def _set_busy(self, busy: bool, which: str = ""):
         self.busy = busy
-        self.run_btn.setEnabled(not busy)
+        self.run_btn.setEnabled(not busy and bool(self.config.get("shows")))
         self.run_recent_btn.setEnabled(not busy)
         if busy:
             (self.status_batch if which == "batch" else self.status_recent).setText("Working…")
@@ -1170,7 +1193,8 @@ class TorrentAutomatorGUI(QMainWindow):
             return
         self._save_config(save_to_disk=False)
         if not self.config.get("shows"):
-            QMessageBox.information(self, "Batch automation", "Add some shows to My shows first.")
+            QMessageBox.information(self, "Download basket",
+                                    "Your basket is empty. Click covers to add the shows you want to download.")
             return
         if not (self.config.get("anilist_username") or "").strip():
             QMessageBox.information(self, "Batch automation",
@@ -1278,9 +1302,9 @@ class TorrentAutomatorGUI(QMainWindow):
             f"AniTorrent Sync v{APP_VERSION}\n\n"
             "Library\n"
             "  • Enter your AniList username and Fetch AniList to see your Watching list.\n"
-            "  • Click covers to select shows, then add them to My shows.\n"
-            "  • Browse AniList to search for any show.\n"
-            "  • 'Check for new episodes' finds episodes after your AniList progress.\n\n"
+            "  • Shows are grouped into Behind, Finished airing and Up to date.\n"
+            "  • Click a cover to put it in the download basket; click again to take it out.\n"
+            "  • 'Download basket' finds the episodes after your AniList progress for every show in the basket.\n\n"
             "Recent Releases\n"
             "  • Grab the latest releases for any shows, optionally for one episode.\n\n"
             "Before anything is downloaded you'll see a review screen listing every release, "
