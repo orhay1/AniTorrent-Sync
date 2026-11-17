@@ -95,6 +95,8 @@ class ParsingTests(unittest.TestCase):
             "[Erai-raws] Cyberpunk: Edgerunners 2 - 01 ~ 10 [1080p NF WEB-DL HEVC EAC3][MultiSub] [BATCH]"))
         self.assertTrue(main.is_batch_release("[Anime Time] Cyberpunk Edgerunners (Season 1) [BD] [Batch]"))
         self.assertTrue(main.is_batch_release("[Group] Show (01-12) [1080p]"))
+        self.assertTrue(main.is_batch_release("The Apothecary Diaries S02E07-11 MULTi 1080p WEB"))
+        self.assertFalse(main.is_batch_release("Firefly Wedding S01E02 Tennyo Island 1080p CR WEB-DL"))
         self.assertFalse(main.is_batch_release("[SubsPlease] Ao no Hako Season 2 - 04 (1080p) [AAAA].mkv"))
         self.assertFalse(main.is_batch_release("[SubsPlease] Spy x Family S2 - 05 (1080p)"))
 
@@ -113,6 +115,53 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(main.extract_season_number("Cyberpunk Edgerunners (Season 1) [BD]"), 1)
         self.assertIsNone(main.extract_season_number("[Erai-raws] Cyberpunk: Edgerunners 2 - 05 [1080p]"))
         self.assertIsNone(main.extract_season_number("[ASW] Show - 05 [1080p HEVC x265][MultiSubs]"))
+
+
+FINISHED_RSS = [
+    {"title": "[SubsPlease] Kusuriya no Hitorigoto - 24 (1080p) [A].mkv", "link": "S24", "group": "SubsPlease"},
+    {"title": "[SubsPlease] Kusuriya no Hitorigoto - 23 (1080p) [B].mkv", "link": "S23", "group": "SubsPlease"},
+    {"title": "[Erai-raws] Kusuriya no Hitorigoto - 01 ~ 24 [1080p][Multiple Subtitle] [BATCH]", "link": "EB", "group": "Erai-raws"},
+    {"title": "[Judas] Kusuriya no Hitorigoto (Season 1) [1080p][HEVC x265 10bit][Batch]", "link": "JB", "group": "Judas"},
+    {"title": "[Other] Kusuriya no Hitorigoto - 01 ~ 48 [Batch]", "link": "OB", "group": "Other"},
+]
+FINISHED_ANILIST = {"kusuriya no hitorigoto 2nd season": {
+    "title": "Kusuriya no Hitorigoto 2nd Season", "progress": 1, "episodes": 24, "status": "FINISHED"}}
+
+
+class FinishedShowTests(unittest.TestCase):
+    def _plan(self, rss, groups):
+        async def fake(q):
+            return list(rss)
+        cfg = base_config(shows=["Kusuriya No Hitorigoto 2nd Season"], release_groups=groups)
+        with mock.patch.object(main, "fetch_nyaa_rss", fake):
+            return run(main.build_batch_plan(cfg, log_cb=lambda m: None, anilist=FINISHED_ANILIST))
+
+    def test_batch_from_selected_group_is_preferred(self):
+        sp = self._plan(FINISHED_RSS, ["SubsPlease", "Erai-raws"]).shows[0]
+        batch = [it for it in sp.items if it.is_batch]
+        self.assertEqual(len(batch), 1)
+        self.assertEqual(batch[0].link, "EB")              # season 1 / 48-episode packs rejected
+        self.assertEqual(batch[0].episode, "01–24")
+        self.assertTrue(batch[0].selected)
+        singles = [it for it in sp.items if not it.is_batch]
+        self.assertEqual(sorted(it.episode for it in singles), ["23", "24"])
+        self.assertFalse(any(it.selected for it in singles))  # batch replaces them
+
+    def test_no_batch_in_groups_lists_singles_and_missing(self):
+        sp = self._plan([r for r in FINISHED_RSS if r["link"] != "EB"], ["SubsPlease"]).shows[0]
+        self.assertFalse(any(it.is_batch for it in sp.items))  # remaining packs are wrong season/size
+        self.assertEqual(sorted(it.episode for it in sp.items if it.selected), ["23", "24"])
+        self.assertIn("Not found on Nyaa: episode(s) 2–22", sp.message)
+
+    def test_airing_shows_still_skip_batches(self):
+        airing = {"kusuriya no hitorigoto 2nd season": dict(
+            FINISHED_ANILIST["kusuriya no hitorigoto 2nd season"], status="RELEASING")}
+        async def fake(q):
+            return list(FINISHED_RSS)
+        cfg = base_config(shows=["Kusuriya No Hitorigoto 2nd Season"], release_groups=["Erai-raws", "SubsPlease"])
+        with mock.patch.object(main, "fetch_nyaa_rss", fake):
+            plan = run(main.build_batch_plan(cfg, log_cb=lambda m: None, anilist=airing))
+        self.assertFalse(any(it.is_batch for it in plan.items))
 
 
 class ProgressBucketTests(unittest.TestCase):

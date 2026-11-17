@@ -40,6 +40,7 @@ class GuiTests(unittest.TestCase):
 
     def setUp(self):
         import gui
+        gui.TorrentAutomatorGUI.AUTO_FETCH = False
         self.gui = gui
         patches = [
             mock.patch.object(gui, "load_prefs", return_value={}),
@@ -180,6 +181,19 @@ class GuiTests(unittest.TestCase):
                             "other": dict(base, title="Other", progress=1, episodes=12, aired=1)})
         checked = [it.data(gui_role_title()) for it in self.w.anilist_grid.checked_items()]
         self.assertEqual(checked, ["Frieren"])
+
+
+    def test_auto_fetch_on_startup(self):
+        self.gui.TorrentAutomatorGUI.AUTO_FETCH = True
+        self.addCleanup(setattr, self.gui.TorrentAutomatorGUI, "AUTO_FETCH", False)
+        data = {"frieren": {"title": "Frieren", "progress": 3, "episodes": 28, "aired": 28,
+                            "status": "FINISHED", "cover": "", "color": ""}}
+        with mock.patch.object(self.gui, "fetch_anilist_progress", mock.AsyncMock(return_value=data)):
+            w = self.gui.TorrentAutomatorGUI()
+            spin_until(lambda: w.anilist_grid.count() > 0)
+        self.assertEqual(w.anilist_grid.sections["finished"]["grid"].count(), 1)
+        w.config_dirty = False
+        w.close()
 
 
 def gui_role_title():
