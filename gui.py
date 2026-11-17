@@ -3,6 +3,7 @@ import sys
 import webbrowser
 import subprocess
 import re
+import time
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Any, List
@@ -21,12 +22,15 @@ import yaml
 
 # ---- import from existing modules ----
 from torrent_automator.config import load_config
-from torrent_automator.anilist import fetch_anilist_progress, search_anilist
+from torrent_automator.anilist import (
+    fetch_anilist_progress, search_anilist, progress_bucket,
+    BUCKET_BEHIND, BUCKET_FINISHED, BUCKET_CAUGHT_UP,
+)
 from torrent_automator.groups import POPULAR_GROUPS
 from torrent_automator.plan import format_plan
 from torrent_automator.ui import theme
 from torrent_automator.ui.widgets import (
-    AsyncWorker, CoverGrid, ThumbList, AniListBrowseDialog, ROLE_KEY,
+    AsyncWorker, GroupedCoverGrid, ThumbList, AniListBrowseDialog, ROLE_KEY,
 )
 from torrent_automator.ui.confirm_dialog import ConfirmDownloadDialog
 from main import build_batch_plan, build_recent_plan, execute_plan_items
@@ -72,6 +76,42 @@ def normalize_show_name(name: str) -> str:
 
 def pretty_title(name: str) -> str:
     return " ".join(w.capitalize() for w in normalize_show_name(name).split())
+
+
+def _until(ts) -> str:
+    """Short countdown like '2d 4h' / '5h' / '20m' to a unix timestamp."""
+    try:
+        secs = int(ts) - int(time.time())
+    except Exception:
+        return ""
+    if secs <= 0:
+        return "now"
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    if d:
+        return f"{d}d {h}h"
+    return f"{h}h" if h else f"{max(1, rem // 60)}m"
+
+
+def progress_label(info: dict, short: bool = False) -> str:
+    """Card subtitle describing where you are in a show."""
+    if not info:
+        return ""
+    prog = int(info.get("progress") or 0)
+    eps = info.get("episodes")
+    aired = info.get("aired")
+    bucket = progress_bucket(info)
+    base = f"Ep {prog} / {eps if eps else '?'}"
+    if bucket == BUCKET_BEHIND and aired is not None:
+        extra = f"{aired - prog} new"
+    elif bucket == BUCKET_FINISHED:
+        left = (eps - prog) if eps else None
+        extra = f"{left} left · finished" if left else "finished"
+    elif info.get("next_episode") and info.get("next_airing_at"):
+        extra = f"ep {info['next_episode']} in {_until(info['next_airing_at'])}"
+    else:
+        extra = "up to date"
+    return f"{base} · {extra}" if not short else (extra if extra != "up to date" else "Up to date")
 
 
 def card(title: str = "") -> tuple[QFrame, QVBoxLayout]:
@@ -252,7 +292,7 @@ class TorrentAutomatorGUI(QMainWindow):
         save_prefs(self.prefs)
         for w in (getattr(self, "anilist_grid", None),):
             if w is not None:
-                w.viewport().update()
+                w.refresh()
 
     # -----------------------------------------------------------------
     # Library tab: AniList watching grid + configured shows
@@ -339,7 +379,11 @@ class TorrentAutomatorGUI(QMainWindow):
         tools.addWidget(self.add_selected)
         rl.addLayout(tools)
 
-        self.anilist_grid = CoverGrid(card_width=138)
+        self.anilist_grid = GroupedCoverGrid([
+            (BUCKET_BEHIND, "Behind", "Aired episodes you haven't watched yet"),
+            (BUCKET_FINISHED, "Finished airing", "The whole season is out, you haven't finished it"),
+            (BUCKET_CAUGHT_UP, "Up to date", "You've watched everything that has aired"),
+        ], card_width=138)
         self.anilist_grid.setToolTip("Click covers to select shows, then 'Add to my shows'.")
         self.anilist_grid.checkedChanged.connect(self._update_add_btn)
         rl.addWidget(self.anilist_grid, 1)
@@ -798,10 +842,18 @@ class TorrentAutomatorGUI(QMainWindow):
             sub = ""
             if self.anilist_data and s.lower() not in watching:
                 sub = "Not on Watching list"
+            elif s.lower() in watching:
+                sub = progress_label(self._anilist_info(s), short=True)
             self.shows_list.add_show(s, s, sub, m.get("cover", ""), m.get("color", ""))
         self.my_shows_title.setText(f"My shows ({len(shows)})")
         self._update_batch_summary()
         self._refresh_badges()
+
+    def _anilist_info(self, show: str) -> dict:
+        for k, v in self.anilist_data.items():
+            if pretty_title(k).lower() == (show or "").lower():
+                return v
+        return {}
 
     def _refresh_badges(self):
         if not hasattr(self, "anilist_grid"):
@@ -809,7 +861,7 @@ class TorrentAutomatorGUI(QMainWindow):
         shows = {s.lower() for s in self.config.get("shows", []) or []}
         for it in self.anilist_grid.items():
             it.setData(Qt.ItemDataRole.UserRole + 5, "In my shows" if (it.data(ROLE_KEY) or "").lower() in shows else "")
-        self.anilist_grid.viewport().update()
+        self.anilist_grid.refresh()
 
     # -----------------------------------------------------------------
     # AniList + shows
@@ -845,12 +897,10 @@ class TorrentAutomatorGUI(QMainWindow):
             t = pretty_title(k)
             self.anilist_titles.append(t)
             self._remember_meta(t, v)
-            frac = (prog / eps) if eps else None
-            sub = f"Ep {prog} / {eps if eps else '?'}"
-            if v.get("format"):
-                sub += f" · {v['format']}"
-            self.anilist_grid.add_card(t, v.get("title") or t, sub, v.get("cover", ""), v.get("color", ""),
-                                       progress=frac, info=v)
+            total = eps or v.get("aired")
+            frac = (prog / total) if total else None
+            self.anilist_grid.add_card(t, v.get("title") or t, progress_label(v), v.get("cover", ""),
+                                       v.get("color", ""), progress=frac, info=v, group=progress_bucket(v))
         save_prefs(self.prefs)
         self.anilist_filter.clear()
         self.anilist_empty.setVisible(not data)

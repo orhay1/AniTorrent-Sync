@@ -105,6 +105,9 @@ QFrame#Header {{
     border-bottom: 1px solid {c['border']};
 }}
 QFrame#Header QLabel {{ background: transparent; }}
+QWidget#Transparent {{ background: transparent; }}
+QScrollArea#GroupedGrid, QScrollArea#GroupedGrid > QWidget {{ background: transparent; border: none; }}
+QLabel#GroupTitle {{ font-size: 11pt; font-weight: 700; }}
 QLabel#AppTitle {{ font-size: 15pt; font-weight: 700; }}
 QLabel#SectionTitle {{ font-size: 12pt; font-weight: 600; }}
 QLabel#Muted {{ color: {c['muted']}; }}

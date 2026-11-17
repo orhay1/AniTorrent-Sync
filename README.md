@@ -72,7 +72,7 @@ runGUI.bat
 The GUI supports:
 
 - Dark/Light theme
-- Fetching AniList shows, shown as a cover grid with watch progress
+- Fetching AniList shows, shown as a cover grid with watch progress, grouped into **Behind** (aired episodes you haven't watched), **Finished airing** (season is out, not finished by you) and **Up to date** (with a countdown to the next episode)
 - Selecting shows to add to the config by clicking their covers
 - Browsing AniList (trending airing shows or search) to add any show
 - A review dialog before downloading, listing each episode, the chosen group, other available groups, and shows that were skipped and why

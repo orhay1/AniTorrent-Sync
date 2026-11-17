@@ -13,6 +13,7 @@ MEDIA_FIELDS = """
     averageScore
     siteUrl
     coverImage { large medium color }
+    nextAiringEpisode { episode airingAt }
 """
 
 
@@ -26,19 +27,60 @@ def _media_info(media: dict) -> dict:
         episodes = int(episodes) if episodes is not None else None
     except Exception:
         episodes = None
+    status = media.get("status") or ""
+    nxt = media.get("nextAiringEpisode") or {}
+    next_episode = nxt.get("episode")
+    # Episodes released so far: one before the next scheduled one, or all of them once finished.
+    if next_episode:
+        aired = max(0, int(next_episode) - 1)
+    elif status in ("FINISHED", "CANCELLED"):
+        aired = episodes
+    elif status == "NOT_YET_RELEASED":
+        aired = 0
+    else:
+        aired = None
     return {
         "id": media.get("id"),
         "title": title.get("romaji") or "",
         "title_english": title.get("english") or "",
         "episodes": episodes,
         "format": media.get("format") or "",
-        "status": media.get("status") or "",
         "season_year": media.get("seasonYear"),
         "score": media.get("averageScore"),
         "site_url": media.get("siteUrl") or "",
         "cover": cover.get("large") or cover.get("medium") or "",
         "color": cover.get("color") or "",
+        "status": status,
+        "aired": aired,
+        "next_episode": next_episode,
+        "next_airing_at": nxt.get("airingAt"),
     }
+
+
+# progress_bucket() results, in the order the GUI shows them
+BUCKET_BEHIND = "behind"
+BUCKET_FINISHED = "finished"
+BUCKET_CAUGHT_UP = "caught_up"
+
+
+def progress_bucket(info: dict) -> str:
+    """
+    Where a Watching-list entry stands:
+      behind    - still airing and there are aired episodes you haven't watched
+      finished  - the show has finished airing but you haven't watched all of it
+      caught_up - you've watched everything that has aired so far
+    """
+    progress = int(info.get("progress") or 0)
+    status = info.get("status") or ""
+    episodes = info.get("episodes")
+    aired = info.get("aired")
+    if status in ("FINISHED", "CANCELLED"):
+        if episodes is None or progress < episodes:
+            return BUCKET_FINISHED
+        return BUCKET_CAUGHT_UP
+    if aired is not None and progress < aired:
+        return BUCKET_BEHIND
+    return BUCKET_CAUGHT_UP
 
 
 async def _post(query: str, variables: dict) -> dict:

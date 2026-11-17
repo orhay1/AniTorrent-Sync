@@ -103,14 +103,14 @@ class GuiTests(unittest.TestCase):
         self.assertFalse(self.w.config_dirty)
 
     def test_space_toggles_card(self):
-        grid = self.w.anilist_grid
+        grid = self.w.anilist_grid.grids()[0]
         it = grid.add_card("A", "Show A")
         grid.setCurrentItem(it)
         QTest.keyClick(grid, Qt.Key.Key_Space)
         self.assertEqual(it.checkState(), Qt.CheckState.Checked)
 
     def test_card_click_toggles_once(self):
-        grid = self.w.anilist_grid
+        grid = self.w.anilist_grid.grids()[0]
         grid.add_card("A", "Show A")
         grid.add_card("B", "Show B")
         self.w.resize(1300, 800)
@@ -123,6 +123,32 @@ class GuiTests(unittest.TestCase):
             before = it.checkState()
             QTest.mouseClick(grid.viewport(), Qt.MouseButton.LeftButton, pos=pos)
             self.assertNotEqual(it.checkState(), before, f"click at {pos} did not toggle exactly once")
+
+
+    def test_library_grouped_by_progress(self):
+        base = {"cover": "", "color": "", "format": "TV"}
+        data = {
+            "behind show": dict(base, title="Behind Show", progress=3, episodes=12, aired=6, status="RELEASING"),
+            "done airing": dict(base, title="Done Airing", progress=0, episodes=10, aired=10, status="FINISHED"),
+            "caught show": dict(base, title="Caught Show", progress=7, episodes=12, aired=7, status="RELEASING",
+                                next_episode=8, next_airing_at=0),
+        }
+        self.w._on_anilist(data)
+        secs = self.w.anilist_grid.sections
+        titles = {k: [it.data(gui_role_title()) for it in v["grid"].items()] for k, v in secs.items()}
+        self.assertEqual(titles, {"behind": ["Behind Show"], "finished": ["Done Airing"],
+                                  "caught_up": ["Caught Show"]})
+        self.assertEqual(self.w.anilist_grid.count(), 3)
+        # select all + add goes across every section
+        self.w.anilist_grid.set_all_checked(True)
+        self.assertEqual(len(self.w.anilist_grid.checked_items()), 3)
+        self.assertIn("3 new", self.gui.progress_label(data["behind show"]))
+        self.assertIn("10 left", self.gui.progress_label(data["done airing"]))
+
+
+def gui_role_title():
+    from torrent_automator.ui.widgets import ROLE_TITLE
+    return ROLE_TITLE
 
 
 if __name__ == "__main__":
