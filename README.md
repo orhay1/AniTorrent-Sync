@@ -73,7 +73,7 @@ The GUI supports:
 
 - Dark/Light theme
 - Fetching AniList shows, shown as a cover grid with watch progress, grouped into **Behind** (aired episodes you haven't watched), **Finished airing** (season is out, not finished by you) and **Up to date** (with a countdown to the next episode)
-- Selecting shows to add to the config by clicking their covers
+- A download basket: click a cover to add the show (click again to remove it), then **Download basket** finds the new episodes for just those shows (the basket is the `shows` list in `config.yaml`, so the CLI uses it too)
 - Browsing AniList (trending airing shows or search) to add any show
 - A review dialog before downloading, listing each episode, the chosen group, other available groups, and shows that were skipped and why
 - Defining release groups and priority

@@ -315,7 +315,8 @@ class GroupedCoverGrid(QScrollArea):
     """
     checkedChanged = pyqtSignal()
 
-    def __init__(self, groups: list[tuple[str, str, str]], card_width: int = 150, parent=None):
+    def __init__(self, groups: list[tuple[str, str, str]], card_width: int = 150,
+                 select_all_text: str = "Select all", parent=None):
         """groups: (key, title, description) in display order."""
         super().__init__(parent)
         self.setObjectName("GroupedGrid")
@@ -336,7 +337,7 @@ class GroupedCoverGrid(QScrollArea):
             lbl.setObjectName("GroupTitle")
             sub = QLabel(desc)
             sub.setObjectName("Hint")
-            sel = QPushButton("Select all")
+            sel = QPushButton(select_all_text)
             sel.setObjectName("Flat")
             head.addWidget(lbl)
             head.addSpacing(8)
