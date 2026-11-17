@@ -89,9 +89,11 @@ def _safe_query_tokens(show: str, quality: str, codec: str) -> list[str]:
         return " ".join(p for p in parts if p).strip()
 
     tokens = [join_parts(base, quality, codec)]
-    if " season " in f" {base} ":
-        head, tail = base.split(" season ", 1)
-        tokens.append(join_parts(base.replace(" season ", " s "), quality, codec))
+    padded = f" {base} "
+    if " season " in padded:
+        # split the padded name so titles that start/end with "season" (e.g. "Aoashi 2nd Season") work
+        head, tail = padded.split(" season ", 1)
+        tokens.append(join_parts(padded.replace(" season ", " s ").strip(), quality, codec))
         if tail.strip().isdigit():
             n = tail.strip()
             tokens.append(join_parts(head.strip(), "s", n, quality, codec))
