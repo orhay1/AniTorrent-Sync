@@ -12,6 +12,8 @@ A tool that fetches new episodes from Nyaa, matches them to the user's AniList *
 - Fetch recent releases for one or more shows (optional episode filter)
 - Built-in popular release group list
 - Use the modern GUI to view logs, tweak preferences, and reorder groups
+- AniList cover art when browsing your Watching list, searching AniList, and picking shows
+- Review step before anything is downloaded: see every release, the group it comes from, and which other groups have it
 
 ## Installation
 
@@ -47,9 +49,11 @@ You can also use the helper script:
 runCLI.bat
 ```
 
+Before sending anything, the CLI prints the download plan (quality, codec, selected groups, and per show the chosen release and the groups available) and asks once: `y` to send all pre-selected releases, `s` to pick individually, `n` to cancel.
+
 Options:
 
-- `--non-interactive` – automatically send the best match to qBittorrent
+- `--non-interactive` – skip the confirmation and automatically send the pre-selected releases to qBittorrent
 
 ## GUI Usage
 
@@ -68,14 +72,22 @@ runGUI.bat
 The GUI supports:
 
 - Dark/Light theme
-- Fetching AniList shows
-- Selecting shows to add to the config
+- Fetching AniList shows, shown as a cover grid with watch progress
+- Selecting shows to add to the config by clicking their covers
+- Browsing AniList (trending airing shows or search) to add any show
+- A review dialog before downloading, listing each episode, the chosen group, other available groups, and shows that were skipped and why
 - Defining release groups and priority
 - Batch automation with real-time logs
 - Recent releases tab (multi-show, group, count, quality/codec override, optional episode)
 - Load popular release groups into the picker
 - Save/reload config from the menu
 - Open qBittorrent (WebUI or app)
+
+## Tests
+
+```bash
+python -m unittest discover -s tests
+```
 
 ## To-Do
 

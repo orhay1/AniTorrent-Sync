@@ -4,12 +4,26 @@ import re
 from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
 
-async def search_nyaa(query: str, allowed_groups=None, limit: int = 15):
+def release_group(title: str) -> str:
+    """Return the release group from a title like "[ASW] Show - 01", or ""."""
+    m = re.match(r"^\s*\[(.*?)\]", title or "")
+    return m.group(1).strip() if m else ""
+
+
+def in_groups(title: str, allowed_groups) -> bool:
+    """True if the title's [group] prefix matches one of allowed_groups (or none given)."""
+    if not allowed_groups:
+        return True
+    lowered = (title or "").lower()
+    return any(lowered.startswith(f"[{g.lower()}]") for g in allowed_groups if g)
+
+
+async def fetch_nyaa_rss(query: str) -> list[dict]:
     """
-    Search Nyaa.si using its RSS feed and return a filtered list of torrents.
-    Only includes results from allowed_groups if provided (prefix match like "[ASW] ...").
+    Fetch the raw Nyaa.si RSS results for a query (no group filtering).
+    Each result: {"title", "link", "group"}.
     """
-    url = f"https://nyaa.si/?page=rss&q={query.replace(' ', '+')}"
+    url = f"https://nyaa.si/?page=rss&q={quote_plus(query)}"
 
     async with httpx.AsyncClient() as client:
         response = await client.get(url)
@@ -25,24 +39,22 @@ async def search_nyaa(query: str, allowed_groups=None, limit: int = 15):
             continue
 
         title = title_el.text or ""
-        torrent_page_url = guid_el.text or ""
-
-        # Filter by allowed release groups (if given)
-        if allowed_groups:
-            lowered = title.lower()
-            # accept if any priority group matches title prefix like: [group]
-            if not any(lowered.startswith(f"[{g.lower()}]") for g in allowed_groups):
-                continue
-
         results.append({
             "title": title,
-            "link": torrent_page_url
+            "link": guid_el.text or "",
+            "group": release_group(title),
         })
 
-        if len(results) >= limit:
-            break
-
     return results
+
+
+async def search_nyaa(query: str, allowed_groups=None, limit: int = 15):
+    """
+    Search Nyaa.si using its RSS feed and return a filtered list of torrents.
+    Only includes results from allowed_groups if provided (prefix match like "[ASW] ...").
+    """
+    results = [r for r in await fetch_nyaa_rss(query) if in_groups(r["title"], allowed_groups)]
+    return results[:limit]
 
 
 def score_result(title: str, group_priority: list[str]) -> int:
