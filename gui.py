@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 import sys
-import asyncio
 import webbrowser
 import subprocess
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Any, List
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QPushButton, QLabel, QTabWidget, QTextEdit, QDockWidget, QCheckBox,
-    QListWidget, QListWidgetItem, QLineEdit, QComboBox, QGroupBox, QMessageBox,
-    QFileDialog, QRadioButton, QDialog, QDialogButtonBox, QInputDialog, QSpinBox
+    QListWidget, QLineEdit, QComboBox, QMessageBox, QFrame,
+    QFileDialog, QRadioButton, QDialog, QDialogButtonBox, QInputDialog, QSpinBox,
+    QSplitter, QStyleFactory, QScrollArea,
 )
-from PyQt6.QtGui import QAction
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QRunnable, QThreadPool
+from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtCore import Qt, QThreadPool
 
-import qdarkstyle
 import yaml
 
 # ---- import from existing modules ----
 from torrent_automator.config import load_config
-from torrent_automator.anilist import fetch_anilist_progress
+from torrent_automator.anilist import fetch_anilist_progress, search_anilist
 from torrent_automator.groups import POPULAR_GROUPS
-from main import run_automation, run_recent_fetch
+from torrent_automator.plan import format_plan
+from torrent_automator.ui import theme
+from torrent_automator.ui.widgets import (
+    AsyncWorker, CoverGrid, ThumbList, AniListBrowseDialog, ROLE_KEY,
+)
+from torrent_automator.ui.confirm_dialog import ConfirmDownloadDialog
+from main import build_batch_plan, build_recent_plan, execute_plan_items
 
 # ---------------------------------------------------------------------
 # Helpers & persistent prefs
@@ -33,7 +39,10 @@ DEFAULT_GROUPS = ["ASW", "Judas"]
 DEFAULT_QUALITIES = ["1080p", "720p"]
 # blank option comes from UI as "(none)" and we simply don't save 'codec' when blank is chosen
 DEFAULT_CODECS = ["HEVC", "x265", "x264"]
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
+BATCH_NOTE = ("Batch automation only downloads shows that are on your AniList Watching list. "
+              "Shows added from search are still useful for Recent Releases.")
+
 
 def load_prefs() -> dict:
     if PREFS_PATH.exists():
@@ -44,12 +53,14 @@ def load_prefs() -> dict:
             return {}
     return {}
 
+
 def save_prefs(prefs: dict):
     try:
         with open(PREFS_PATH, "w", encoding="utf-8") as f:
             yaml.safe_dump(prefs, f, sort_keys=False, allow_unicode=True)
     except Exception:
         pass
+
 
 def normalize_show_name(name: str) -> str:
     s = name or ""
@@ -58,83 +69,45 @@ def normalize_show_name(name: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip().lower()
 
+
 def pretty_title(name: str) -> str:
     return " ".join(w.capitalize() for w in normalize_show_name(name).split())
 
-# ---------------------------------------------------------------------
-# Async workers
-# ---------------------------------------------------------------------
-class AniListWorker(QRunnable):
-    class Signals(QObject):
-        result = pyqtSignal(dict)
-        error = pyqtSignal(str)
-        finished = pyqtSignal()
-    def __init__(self, username: str):
-        super().__init__()
-        self.username = username
-        self.signals = self.Signals()
-    def run(self):
-        try:
-            data = asyncio.run(fetch_anilist_progress(self.username))
-            self.signals.result.emit(data)
-        except Exception as e:
-            self.signals.error.emit(str(e))
-        finally:
-            self.signals.finished.emit()
 
-class AutomationWorker(QRunnable):
-    class Signals(QObject):
-        line = pyqtSignal(str)
-        done = pyqtSignal()
-    def __init__(self, config: dict):
-        super().__init__()
-        self.config = config
-        self.signals = self.Signals()
-    def run(self):
-        asyncio.run(self._run())
-    async def _run(self):
-        try:
-            await run_automation(
-                config=self.config,
-                non_interactive=True,
-                log_cb=self.signals.line.emit,
-            )
-        except Exception as e:
-            self.signals.line.emit(f"❌ Error: {e}")
-        finally:
-            self.signals.done.emit()
+def card(title: str = "") -> tuple[QFrame, QVBoxLayout]:
+    """A rounded surface with an optional section title."""
+    frame = QFrame()
+    frame.setObjectName("Card")
+    lay = QVBoxLayout(frame)
+    lay.setContentsMargins(14, 12, 14, 12)
+    lay.setSpacing(10)
+    if title:
+        t = QLabel(title)
+        t.setObjectName("SectionTitle")
+        lay.addWidget(t)
+    return frame, lay
 
-class RecentWorker(QRunnable):
-    class Signals(QObject):
-        line = pyqtSignal(str)
-        done = pyqtSignal()
-    def __init__(self, config: dict):
-        super().__init__()
-        self.config = config
-        self.signals = self.Signals()
-    def run(self):
-        asyncio.run(self._run())
-    async def _run(self):
-        try:
-            await run_recent_fetch(
-                config=self.config,
-                non_interactive=True,
-                log_cb=self.signals.line.emit,
-            )
-        except Exception as e:
-            self.signals.line.emit(f"Error: {e}")
-        finally:
-            self.signals.done.emit()
+
+def hint(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setObjectName("Hint")
+    lbl.setWordWrap(True)
+    return lbl
+
+
+def transparent(widget: QWidget) -> QWidget:
+    widget.setObjectName("Transparent")
+    return widget
 
 
 # ---------------------------------------------------------------------
 # Group Reorder Dialog (drag & drop)
 # ---------------------------------------------------------------------
 class GroupReorderDialog(QDialog):
-    def __init__(self, groups: List[str]):
-        super().__init__()
+    def __init__(self, groups: List[str], parent=None):
+        super().__init__(parent)
         self.setWindowTitle("Set Group Priority Order")
-        self.resize(320, 420)
+        self.resize(340, 440)
         v = QVBoxLayout(self)
         self.list = QListWidget()
         self.list.addItems(groups)
@@ -145,8 +118,10 @@ class GroupReorderDialog(QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         v.addWidget(btns)
+
     def get_order(self) -> List[str]:
         return [self.list.item(i).text() for i in range(self.list.count())]
+
 
 # ---------------------------------------------------------------------
 # GUI MainWindow
@@ -154,9 +129,8 @@ class GroupReorderDialog(QDialog):
 class TorrentAutomatorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Torrent Automator GUI")
-        self.resize(1200, 760)
-        self.setStyleSheet(qdarkstyle.load_stylesheet_pyqt6())
+        self.setWindowTitle("AniTorrent Sync")
+        self.resize(1360, 820)
 
         self.thread_pool = QThreadPool()
         self.config_path = Path(__file__).parent / "config.yaml"
@@ -170,32 +144,87 @@ class TorrentAutomatorGUI(QMainWindow):
         self.prefs.setdefault("use_web_ui", False)
         self.prefs.setdefault("qbittorrent_path", "")
         self.prefs.setdefault("nyaa_groups", [])
+        self.prefs.setdefault("theme", "dark")
+        # show name (lowercase) -> {"cover", "color", "title"} so configured shows keep their covers
+        self.prefs.setdefault("show_meta", {})
         if not self.prefs.get("nyaa_groups"):
             self.prefs["nyaa_groups"] = POPULAR_GROUPS[:]
         save_prefs(self.prefs)
 
         self.config_dirty = False
         self.anilist_titles: List[str] = []
+        self.anilist_data: Dict[str, dict] = {}
+        self.busy = False
 
+        self._apply_theme(self.prefs.get("theme") != "light")
+
+        central = QWidget()
+        cv = QVBoxLayout(central)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(0)
+        cv.addWidget(self._build_header())
         self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
-        self._init_config_tab()
+        self.tabs.setDocumentMode(True)
+        cv.addWidget(self.tabs, 1)
+        self.setCentralWidget(central)
+
+        self._init_library_tab()
         self._init_recent_tab()
         self._init_settings_tab()
         self._init_log_dock()
+        self._init_menus()
+        self.status_msg = QLabel("Ready")
+        self.statusBar().addWidget(self.status_msg, 1)
 
+        self._load_config()
+
+    # -----------------------------------------------------------------
+    # Chrome: header, menus, logs
+    # -----------------------------------------------------------------
+    def _build_header(self) -> QWidget:
+        header = QFrame()
+        header.setObjectName("Header")
+        h = QHBoxLayout(header)
+        h.setContentsMargins(18, 10, 18, 10)
+        h.setSpacing(10)
+        title_box = QVBoxLayout()
+        title_box.setSpacing(0)
+        title = QLabel("AniTorrent Sync")
+        title.setObjectName("AppTitle")
+        sub = QLabel("AniList  →  Nyaa  →  qBittorrent")
+        sub.setObjectName("Muted")
+        title_box.addWidget(title)
+        title_box.addWidget(sub)
+        h.addLayout(title_box)
+        h.addStretch()
+
+        h.addWidget(QLabel("AniList user"))
+        self.user_edit = QLineEdit()
+        self.user_edit.setPlaceholderText("username")
+        self.user_edit.setFixedWidth(180)
+        self.user_edit.setToolTip("AniList username used to fetch your watching list.")
+        self.user_edit.textChanged.connect(self._mark_dirty)
+        self.user_edit.returnPressed.connect(self._fetch_anilist)
+        h.addWidget(self.user_edit)
+
+        self.save_btn = QPushButton("Save config")
+        self.save_btn.setToolTip("Save config.yaml (Ctrl+S)")
+        self.save_btn.clicked.connect(lambda: self._save_config())
+        h.addWidget(self.save_btn)
+        return header
+
+    def _init_menus(self):
         file_menu = self.menuBar().addMenu("File")
         save_cfg = QAction("Save Config", self)
-        save_cfg.triggered.connect(self._save_config)
+        save_cfg.setShortcut(QKeySequence.StandardKey.Save)
+        save_cfg.triggered.connect(lambda: self._save_config())
         reload_cfg = QAction("Reload Config", self)
         reload_cfg.triggered.connect(self._load_config)
         file_menu.addAction(save_cfg)
         file_menu.addAction(reload_cfg)
 
         view_menu = self.menuBar().addMenu("View")
-        toggle_logs = QAction("Show/Hide Logs", self)
-        toggle_logs.triggered.connect(lambda: self.log_dock.setVisible(not self.log_dock.isVisible()))
-        view_menu.addAction(toggle_logs)
+        view_menu.addAction(self.log_dock.toggleViewAction())
 
         about_menu = self.menuBar().addMenu("About")
         version_action = QAction(f"Version {APP_VERSION}", self)
@@ -205,45 +234,332 @@ class TorrentAutomatorGUI(QMainWindow):
         how_to.triggered.connect(self._show_help_popup)
         about_menu.addAction(how_to)
 
-        self._load_config()
+    def _init_log_dock(self):
+        self.log_dock = QDockWidget("Activity log", self)
+        self.log_dock.setObjectName("LogDock")
+        self.log_text = QTextEdit()
+        self.log_text.setObjectName("Log")
+        self.log_text.setReadOnly(True)
+        self.log_dock.setWidget(self.log_text)
+        self.log_dock.setMinimumWidth(300)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.log_dock)
+        self.resizeDocks([self.log_dock], [340], Qt.Orientation.Horizontal)
+
+    def _apply_theme(self, dark: bool):
+        app = QApplication.instance()
+        app.setStyleSheet(theme.stylesheet(dark))
+        self.prefs["theme"] = "dark" if dark else "light"
+        save_prefs(self.prefs)
+        for w in (getattr(self, "anilist_grid", None),):
+            if w is not None:
+                w.viewport().update()
 
     # -----------------------------------------------------------------
-    # Config Tab
+    # Library tab: AniList watching grid + configured shows
     # -----------------------------------------------------------------
-    def _init_config_tab(self):
-        self.cfg_tab = QWidget()
-        layout = QVBoxLayout(self.cfg_tab)
+    def _init_library_tab(self):
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(12)
 
-        # --- editable config ---
-        grp = QGroupBox("Config Parameters")
-        form = QFormLayout(grp)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
 
-        self.user_edit = QLineEdit()
-        self.user_edit.setToolTip("AniList username used to fetch your watching list.")
-        self.user_edit.textChanged.connect(self._mark_dirty)
-        form.addRow("AniList Username:", self.user_edit)
+        # --- left: my shows ---
+        left, ll = card()
+        head = QHBoxLayout()
+        self.my_shows_title = QLabel("My shows")
+        self.my_shows_title.setObjectName("SectionTitle")
+        head.addWidget(self.my_shows_title)
+        head.addStretch()
+        ll.addLayout(head)
+        ll.addWidget(hint("Shows the batch automation checks for new episodes."))
+        self.shows_list = ThumbList()
+        self.shows_list.setToolTip("Configured shows. Select and press Delete or 'Remove' to drop them.")
+        ll.addWidget(self.shows_list, 1)
+        brow = QHBoxLayout()
+        browse_btn = QPushButton("Browse AniList…")
+        ll.addWidget(browse_btn)
+        browse_btn.setToolTip("Search AniList and add shows with their covers.")
+        browse_btn.clicked.connect(self._browse_for_config)
+        rem_btn = QPushButton("Remove")
+        rem_btn.setToolTip("Remove the selected shows from the config.")
+        rem_btn.clicked.connect(self._remove_selected_shows)
+        clear_btn = QPushButton("Clear all")
+        clear_btn.setObjectName("Danger")
+        clear_btn.setToolTip("Remove every show from the config.")
+        clear_btn.clicked.connect(self._clear_shows)
+        brow.addWidget(rem_btn)
+        brow.addStretch()
+        brow.addWidget(clear_btn)
+        ll.addLayout(brow)
+        del_action = QAction(self.shows_list)
+        del_action.setShortcut(QKeySequence.StandardKey.Delete)
+        del_action.triggered.connect(self._remove_selected_shows)
+        self.shows_list.addAction(del_action)
+        left.setMinimumWidth(280)
+        split.addWidget(left)
 
-        self.qual_combo = QComboBox(); self.qual_combo.setEditable(True)
+        # --- right: AniList watching grid ---
+        right, rl = card()
+        top = QHBoxLayout()
+        t = QLabel("AniList · Watching")
+        t.setObjectName("SectionTitle")
+        top.addWidget(t)
+        top.addStretch()
+        self.fetch_btn = QPushButton("Fetch AniList")
+        self.fetch_btn.setObjectName("Primary")
+        self.fetch_btn.setToolTip("Fetch your AniList watching list.")
+        self.fetch_btn.clicked.connect(self._fetch_anilist)
+        top.addWidget(self.fetch_btn)
+        rl.addLayout(top)
+
+        tools = QHBoxLayout()
+        self.anilist_filter = QLineEdit()
+        self.anilist_filter.setPlaceholderText("Filter…")
+        self.anilist_filter.setClearButtonEnabled(True)
+        self.anilist_filter.setMaximumWidth(260)
+        self.anilist_filter.textChanged.connect(lambda t: self.anilist_grid.filter(t))
+        sel_all = QPushButton("Select all")
+        sel_all.setObjectName("Flat")
+        sel_all.clicked.connect(lambda: self.anilist_grid.set_all_checked(True))
+        sel_none = QPushButton("Select none")
+        sel_none.setObjectName("Flat")
+        sel_none.clicked.connect(lambda: self.anilist_grid.set_all_checked(False))
+        self.add_selected = QPushButton("Add to my shows")
+        self.add_selected.setToolTip("Add the selected AniList shows to the config.")
+        self.add_selected.setEnabled(False)
+        self.add_selected.clicked.connect(self._add_selected)
+        tools.addWidget(self.anilist_filter)
+        tools.addWidget(sel_all)
+        tools.addWidget(sel_none)
+        tools.addStretch()
+        tools.addWidget(self.add_selected)
+        rl.addLayout(tools)
+
+        self.anilist_grid = CoverGrid(card_width=138)
+        self.anilist_grid.setToolTip("Click covers to select shows, then 'Add to my shows'.")
+        self.anilist_grid.checkedChanged.connect(self._update_add_btn)
+        rl.addWidget(self.anilist_grid, 1)
+        self.anilist_empty = hint("Enter your AniList username above and press “Fetch AniList” to load "
+                                  "your Watching list with covers.")
+        rl.addWidget(self.anilist_empty)
+        split.addWidget(right)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 3)
+        split.setSizes([320, 900])
+        root.addWidget(split, 1)
+
+        # --- action bar ---
+        bar, bl = card()
+        bl.setContentsMargins(14, 10, 14, 10)
+        row = QHBoxLayout()
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        lab = QLabel("Batch automation")
+        lab.setStyleSheet("font-weight: 600;")
+        self.batch_summary = QLabel("")
+        self.batch_summary.setObjectName("Muted")
+        col.addWidget(lab)
+        col.addWidget(self.batch_summary)
+        row.addLayout(col, 1)
+        self.status_batch = QLabel("Idle")
+        self.status_batch.setObjectName("Muted")
+        row.addWidget(self.status_batch)
+        self.run_btn = QPushButton("Check for new episodes…")
+        self.run_btn.setObjectName("Primary")
+        self.run_btn.setToolTip("Find new episodes for your shows. You'll review everything before it downloads.")
+        self.run_btn.clicked.connect(self._run_automation)
+        row.addWidget(self.run_btn)
+        bl.addLayout(row)
+        root.addWidget(bar)
+
+        self.tabs.addTab(page, "Library")
+
+    # -----------------------------------------------------------------
+    # Recent Releases Tab
+    # -----------------------------------------------------------------
+    def _init_recent_tab(self):
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(12)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+
+        # --- shows ---
+        shows_card, sl = card("Shows")
+        sl.addWidget(hint("Tick the shows to fetch the latest releases for."))
+        self.recent_show_list = ThumbList(checkable=True)
+        self.recent_show_list.setToolTip("Select one or more shows for recent releases.")
+        self.recent_show_list.itemChanged.connect(self._mark_dirty)
+        sl.addWidget(self.recent_show_list, 1)
+
+        src = QHBoxLayout()
+        self.recent_use_config = QPushButton("From my shows")
+        self.recent_use_config.setToolTip("Populate the list with shows from your config.")
+        self.recent_use_config.clicked.connect(lambda: self._set_recent_shows(self.config.get("shows", []), checked=True))
+        self.recent_use_anilist = QPushButton("From AniList")
+        self.recent_use_anilist.setToolTip("Populate the list with your fetched AniList Watching shows.")
+        self.recent_use_anilist.clicked.connect(lambda: self._set_recent_shows(self.anilist_titles, checked=True))
+        self.recent_browse = QPushButton("Browse AniList…")
+        self.recent_browse.setToolTip("Search AniList for any show and add it here.")
+        self.recent_browse.clicked.connect(self._browse_for_recent)
+        self.recent_clear = QPushButton("Clear")
+        self.recent_clear.setObjectName("Danger")
+        self.recent_clear.setToolTip("Clear the recent show selection.")
+        self.recent_clear.clicked.connect(self._clear_recent_shows)
+        src.addWidget(self.recent_use_config)
+        src.addWidget(self.recent_use_anilist)
+        src.addWidget(self.recent_browse)
+        src.addStretch()
+        src.addWidget(self.recent_clear)
+        sl.addLayout(src)
+
+        add_row = QHBoxLayout()
+        self.recent_add_edit = QLineEdit()
+        self.recent_add_edit.setPlaceholderText("Or type a show name and press Enter")
+        self.recent_add_edit.setToolTip("Add a show that isn't in your config or AniList.")
+        self.recent_add_edit.returnPressed.connect(self._add_recent_show_from_input)
+        self.recent_add_btn = QPushButton("Add")
+        self.recent_add_btn.clicked.connect(self._add_recent_show_from_input)
+        add_row.addWidget(self.recent_add_edit, 1)
+        add_row.addWidget(self.recent_add_btn)
+        sl.addLayout(add_row)
+        split.addWidget(shows_card)
+
+        # --- filters ---
+        opts_card, ol = card("Filters")
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+
+        grp_row = QHBoxLayout()
+        self.recent_group_combo = QComboBox()
+        self.recent_group_combo.setEditable(True)
+        self.recent_group_combo.setToolTip("Pick a specific release group or choose Any.")
+        self.recent_group_combo.currentTextChanged.connect(self._mark_dirty)
+        self.use_popular_groups_btn = QPushButton("Popular")
+        self.use_popular_groups_btn.setToolTip("Load the built-in list of common release groups.")
+        self.use_popular_groups_btn.clicked.connect(self._load_popular_groups)
+        grp_row.addWidget(self.recent_group_combo, 1)
+        grp_row.addWidget(self.use_popular_groups_btn)
+        form.addRow("Group", transparent(self._wrap(grp_row)))
+
+        self.recent_episode_edit = QLineEdit()
+        self.recent_episode_edit.setPlaceholderText("any (e.g. 01)")
+        self.recent_episode_edit.setToolTip("Optional: filter to a specific episode number.")
+        self.recent_episode_edit.textChanged.connect(self._mark_dirty)
+        form.addRow("Episode", self.recent_episode_edit)
+
+        self.recent_count_spin = QSpinBox()
+        self.recent_count_spin.setRange(1, 200)
+        self.recent_count_spin.setValue(5)
+        self.recent_count_spin.setToolTip("How many recent releases to fetch per show.")
+        self.recent_count_spin.valueChanged.connect(self._mark_dirty)
+        form.addRow("Per show", self.recent_count_spin)
+
+        self.recent_quality_combo = QComboBox()
+        self.recent_quality_combo.setEditable(True)
+        self.recent_quality_combo.addItem("(use global)")
+        self.recent_quality_combo.addItem("Any")
+        self.recent_quality_combo.addItems(self.prefs["qualities"])
+        self.recent_quality_combo.setToolTip("Override global quality for recent releases.")
+        self.recent_quality_combo.currentTextChanged.connect(self._mark_dirty)
+        form.addRow("Quality", self.recent_quality_combo)
+
+        self.recent_codec_combo = QComboBox()
+        self.recent_codec_combo.setEditable(True)
+        self.recent_codec_combo.addItem("(use global)")
+        self.recent_codec_combo.addItem("Any")
+        self.recent_codec_combo.addItems(self.prefs["codecs"])
+        self.recent_codec_combo.setToolTip("Override global codec for recent releases.")
+        self.recent_codec_combo.currentTextChanged.connect(self._mark_dirty)
+        form.addRow("Codec", self.recent_codec_combo)
+        ol.addLayout(form)
+        ol.addStretch()
+        opts_card.setMinimumWidth(320)
+        split.addWidget(opts_card)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        root.addWidget(split, 1)
+
+        bar, bl = card()
+        bl.setContentsMargins(14, 10, 14, 10)
+        row = QHBoxLayout()
+        self.recent_summary = QLabel("")
+        self.recent_summary.setObjectName("Muted")
+        row.addWidget(self.recent_summary, 1)
+        self.status_recent = QLabel("Idle")
+        self.status_recent.setObjectName("Muted")
+        row.addWidget(self.status_recent)
+        self.run_recent_btn = QPushButton("Find releases…")
+        self.run_recent_btn.setObjectName("Primary")
+        self.run_recent_btn.setToolTip("Fetch recent releases for the selected shows. You'll review them before downloading.")
+        self.run_recent_btn.clicked.connect(self._run_recent)
+        row.addWidget(self.run_recent_btn)
+        bl.addLayout(row)
+        root.addWidget(bar)
+        self.recent_show_list.itemChanged.connect(lambda *_: self._update_recent_summary())
+        self.tabs.addTab(page, "Recent Releases")
+
+    @staticmethod
+    def _wrap(layout) -> QWidget:
+        w = QWidget()
+        layout.setContentsMargins(0, 0, 0, 0)
+        w.setLayout(layout)
+        return w
+
+    # -----------------------------------------------------------------
+    # Settings Tab
+    # -----------------------------------------------------------------
+    def _init_settings_tab(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        v = QVBoxLayout(inner)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(12)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+        # --- search preferences ---
+        search_card, sl = card("Search preferences")
+        sl.addWidget(hint("Used by batch automation and as defaults for Recent Releases."))
+        form = QFormLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        self.qual_combo = QComboBox()
+        self.qual_combo.setEditable(True)
         self.qual_combo.addItem("Any")
         self.qual_combo.addItems(self.prefs["qualities"])
         self.qual_combo.setToolTip("Preferred video quality for searches.")
         self.qual_combo.currentTextChanged.connect(self._mark_dirty)
-        form.addRow("Quality:", self.qual_combo)
+        form.addRow("Quality", self.qual_combo)
 
-        self.codec_combo = QComboBox(); self.codec_combo.setEditable(True)
+        self.codec_combo = QComboBox()
+        self.codec_combo.setEditable(True)
         self.codec_combo.addItem("Any")
         for c in self.prefs["codecs"]:
             self.codec_combo.addItem(c)
         self.codec_combo.setToolTip("Preferred video codec for searches (optional).")
         self.codec_combo.currentTextChanged.connect(self._mark_dirty)
-        form.addRow("Codec:", self.codec_combo)
+        form.addRow("Codec", self.codec_combo)
+        sl.addLayout(form)
+        v.addWidget(search_card)
 
-        # --- release groups dual-mode ---
-        groups_box = QWidget(); gl = QVBoxLayout(groups_box)
+        # --- release groups ---
+        grp_card, gl = card("Release groups")
         modes = QHBoxLayout()
-        self.grp_mode_single = QRadioButton("Use Single Group Only")
-        self.grp_mode_single.setToolTip("Always use the single selected group.")
-        self.grp_mode_prio = QRadioButton("Use Priority Order")
+        self.grp_mode_single = QRadioButton("Single group only")
+        self.grp_mode_single.setToolTip("Only download releases from the selected group.")
+        self.grp_mode_prio = QRadioButton("Priority order")
         self.grp_mode_prio.setToolTip("Prefer releases by group priority order.")
         if self.prefs.get("group_mode") == "single":
             self.grp_mode_single.setChecked(True)
@@ -251,7 +567,10 @@ class TorrentAutomatorGUI(QMainWindow):
             self.grp_mode_prio.setChecked(True)
         self.grp_mode_single.toggled.connect(self._mark_dirty)
         self.grp_mode_prio.toggled.connect(self._mark_dirty)
-        modes.addWidget(self.grp_mode_single); modes.addWidget(self.grp_mode_prio)
+        self.grp_mode_single.toggled.connect(lambda *_: self._update_group_summary())
+        modes.addWidget(self.grp_mode_single)
+        modes.addWidget(self.grp_mode_prio)
+        modes.addStretch()
         gl.addLayout(modes)
 
         hl = QHBoxLayout()
@@ -260,205 +579,63 @@ class TorrentAutomatorGUI(QMainWindow):
         self.grp_combo.addItems(self.prefs["groups"])
         self.grp_combo.setToolTip("Select a preferred release group for single mode.")
         self.grp_combo.currentTextChanged.connect(self._mark_dirty)
-        hl.addWidget(self.grp_combo)
-
+        self.grp_combo.currentTextChanged.connect(lambda *_: self._update_group_summary())
+        hl.addWidget(self.grp_combo, 1)
         self.grp_add = QPushButton("Add")
         self.grp_add.setToolTip("Add a new release group")
         self.grp_add.clicked.connect(self._add_group)
-
         self.grp_rem = QPushButton("Remove")
         self.grp_rem.setToolTip("Remove the currently selected group from known list")
         self.grp_rem.clicked.connect(self._remove_group)
-
-        self.grp_reorder = QPushButton("Reorder...")
+        self.grp_reorder = QPushButton("Reorder…")
         self.grp_reorder.setToolTip("Drag & drop to set priority.")
         self.grp_reorder.clicked.connect(self._reorder_groups)
-
-        hl.addWidget(self.grp_add); hl.addWidget(self.grp_rem); hl.addWidget(self.grp_reorder)
+        hl.addWidget(self.grp_add)
+        hl.addWidget(self.grp_rem)
+        hl.addWidget(self.grp_reorder)
         gl.addLayout(hl)
-        form.addRow("Release Groups:", groups_box)
+        self.group_summary = hint("")
+        gl.addWidget(self.group_summary)
+        v.addWidget(grp_card)
 
-        layout.addWidget(grp)
-
-        # Shows field + controls
-        self.shows_box = QTextEdit(); self.shows_box.setReadOnly(True); self.shows_box.setMinimumHeight(110)
-        layout.addWidget(QLabel("Configured Shows:"))
-        layout.addWidget(self.shows_box)
-        clear_btn = QPushButton("Clear All Shows from Config")
-        clear_btn.setToolTip("Remove every show from the config (no confirmation).")
-        clear_btn.clicked.connect(self._clear_shows)
-        layout.addWidget(clear_btn)
-
-        # AniList section
-        row = QHBoxLayout()
-        self.fetch_btn = QPushButton("Fetch AniList")
-        self.fetch_btn.setToolTip("Fetch your AniList watching list.")
-        self.fetch_btn.clicked.connect(self._fetch_anilist)
-        self.select_all = QPushButton("Select All")
-        self.select_all.setToolTip("Select all fetched AniList shows.")
-        self.select_all.clicked.connect(lambda: self._set_all_checks(True))
-        self.deselect_all = QPushButton("Deselect All")
-        self.deselect_all.setToolTip("Deselect all fetched AniList shows.")
-        self.deselect_all.clicked.connect(lambda: self._set_all_checks(False))
-        self.add_selected = QPushButton("Add Selected to Config")
-        self.add_selected.setToolTip("Add the selected AniList shows to the config.")
-        self.add_selected.clicked.connect(self._add_selected)
-
-        row.addWidget(self.fetch_btn); row.addWidget(self.select_all)
-        row.addWidget(self.deselect_all); row.addWidget(self.add_selected)
-        row.addStretch()
-        layout.addLayout(row)
-
-        self.anilist_list = QListWidget()
-        self.anilist_list.setToolTip("AniList shows you can add to your config.")
-        layout.addWidget(self.anilist_list)
-        self.status_lbl = QLabel("Ready")
-        layout.addWidget(self.status_lbl)
-
-        self.run_btn = QPushButton("Run Batch Automation")
-        self.run_btn.setToolTip("Run batch automation for configured shows.")
-        self.run_btn.clicked.connect(self._run_automation)
-        layout.addWidget(self.run_btn)
-
-        self.status_batch = QLabel("Batch Status: Idle")
-        layout.addWidget(self.status_batch)
-        self.tabs.addTab(self.cfg_tab, "Config Manager")
-
-    # -----------------------------------------------------------------
-    # Recent Releases Tab
-    # -----------------------------------------------------------------
-    def _init_recent_tab(self):
-        w = QWidget(); v = QVBoxLayout(w)
-
-        recent_grp = QGroupBox("Recent Releases")
-        recent_form = QFormLayout(recent_grp)
-
-        self.recent_show_list = QListWidget()
-        self.recent_show_list.setMinimumHeight(140)
-        self.recent_show_list.setToolTip("Select one or more shows for recent releases.")
-
-        show_controls = QHBoxLayout()
-        self.recent_use_config = QPushButton("Use Config Shows")
-        self.recent_use_config.setToolTip("Populate the list with shows from your config.")
-        self.recent_use_config.clicked.connect(lambda: self._set_recent_shows(self.config.get("shows", []), checked=True))
-        self.recent_use_anilist = QPushButton("Use AniList Shows")
-        self.recent_use_anilist.setToolTip("Populate the list with shows from AniList.")
-        self.recent_use_anilist.clicked.connect(lambda: self._set_recent_shows(self.anilist_titles, checked=True))
-        self.recent_clear = QPushButton("Clear")
-        self.recent_clear.setToolTip("Clear the recent show selection.")
-        self.recent_clear.clicked.connect(self._clear_recent_shows)
-        show_controls.addWidget(self.recent_use_config)
-        show_controls.addWidget(self.recent_use_anilist)
-        show_controls.addWidget(self.recent_clear)
-        recent_form.addRow(show_controls)
-        recent_form.addRow("Shows:", self.recent_show_list)
-
-        self.recent_add_edit = QLineEdit()
-        self.recent_add_edit.setPlaceholderText("Show name")
-        self.recent_add_edit.setToolTip("Add a show that isn't in your config or AniList.")
-        self.recent_add_btn = QPushButton("Add Show")
-        self.recent_add_btn.setToolTip("Add the manual show name to the list.")
-        self.recent_add_btn.clicked.connect(self._add_recent_show_from_input)
-        add_row = QHBoxLayout()
-        add_row.addWidget(self.recent_add_edit)
-        add_row.addWidget(self.recent_add_btn)
-        recent_form.addRow("Manual show:", add_row)
-
-        self.recent_group_combo = QComboBox(); self.recent_group_combo.setEditable(True)
-        self.recent_group_combo.setToolTip("Pick a specific release group or choose (any).")
-        self.recent_group_combo.currentTextChanged.connect(self._mark_dirty)
-        recent_form.addRow("Group:", self.recent_group_combo)
-
-        self.recent_episode_edit = QLineEdit()
-        self.recent_episode_edit.setPlaceholderText("e.g. 01")
-        self.recent_episode_edit.setToolTip("Optional: filter to a specific episode number.")
-        self.recent_episode_edit.textChanged.connect(self._mark_dirty)
-        recent_form.addRow("Episode:", self.recent_episode_edit)
-
-        self.recent_count_spin = QSpinBox()
-        self.recent_count_spin.setRange(1, 200)
-        self.recent_count_spin.setValue(5)
-        self.recent_count_spin.setToolTip("How many recent releases to fetch per show.")
-        self.recent_count_spin.valueChanged.connect(self._mark_dirty)
-        recent_form.addRow("Count:", self.recent_count_spin)
-
-        self.recent_quality_combo = QComboBox(); self.recent_quality_combo.setEditable(True)
-        self.recent_quality_combo.addItem("(use global)")
-        self.recent_quality_combo.addItem("Any")
-        self.recent_quality_combo.addItems(self.prefs["qualities"])
-        self.recent_quality_combo.setToolTip("Override global quality for recent releases.")
-        self.recent_quality_combo.currentTextChanged.connect(self._mark_dirty)
-        recent_form.addRow("Quality override:", self.recent_quality_combo)
-
-        self.recent_codec_combo = QComboBox(); self.recent_codec_combo.setEditable(True)
-        self.recent_codec_combo.addItem("(use global)")
-        self.recent_codec_combo.addItem("Any")
-        self.recent_codec_combo.addItems(self.prefs["codecs"])
-        self.recent_codec_combo.setToolTip("Override global codec for recent releases.")
-        self.recent_codec_combo.currentTextChanged.connect(self._mark_dirty)
-        recent_form.addRow("Codec override:", self.recent_codec_combo)
-
-        self.use_popular_groups_btn = QPushButton("Load Popular Groups")
-        self.use_popular_groups_btn.setToolTip("Load the built-in list of common release groups.")
-        self.use_popular_groups_btn.clicked.connect(self._load_popular_groups)
-        recent_form.addRow(self.use_popular_groups_btn)
-
-        v.addWidget(recent_grp)
-
-        run_row = QHBoxLayout()
-        self.run_recent_btn = QPushButton("Fetch Recent Releases")
-        self.run_recent_btn.setToolTip("Fetch recent releases for the selected shows.")
-        self.run_recent_btn.clicked.connect(self._run_recent)
-        run_row.addWidget(self.run_recent_btn)
-        v.addLayout(run_row)
-
-        self.status_recent = QLabel("Recent Status: Idle")
-        v.addWidget(self.status_recent)
-        v.addStretch()
-        self.tabs.addTab(w, "Recent Releases")
-
-    # -----------------------------------------------------------------
-    # Settings Tab
-    # -----------------------------------------------------------------
-    def _init_settings_tab(self):
-        w = QWidget(); v = QVBoxLayout(w)
-        theme = QCheckBox("Light Theme")
-        theme.setToolTip("Toggle between light and dark themes.")
-        theme.stateChanged.connect(lambda s: self.setStyleSheet("" if s else qdarkstyle.load_stylesheet_pyqt6()))
-        v.addWidget(theme)
-
-        self.use_web = QCheckBox("Use Web UI instead of App")
+        # --- qBittorrent ---
+        qb_card, ql = card("qBittorrent")
+        self.use_web = QCheckBox("Open the Web UI instead of the desktop app")
         self.use_web.setToolTip("Open qBittorrent in the browser instead of the desktop app.")
         self.use_web.setChecked(self.prefs.get("use_web_ui", False))
         self.use_web.stateChanged.connect(lambda s: self._set_pref("use_web_ui", bool(s)))
-        v.addWidget(self.use_web)
-
+        ql.addWidget(self.use_web)
+        prow = QHBoxLayout()
         self.qb_path = QLineEdit(self.prefs.get("qbittorrent_path", ""))
         self.qb_path.setPlaceholderText("Path to qbittorrent.exe (used when Web UI is disabled)")
         self.qb_path.setToolTip("Path to qbittorrent.exe when Web UI is disabled.")
         self.qb_path.textChanged.connect(lambda t: self._set_pref("qbittorrent_path", t.strip()))
-        v.addWidget(self.qb_path)
-
-        pick = QPushButton("Browse qBittorrent…")
+        pick = QPushButton("Browse…")
         pick.setToolTip("Browse for qbittorrent.exe.")
         pick.clicked.connect(self._browse_qb)
-        v.addWidget(pick)
-
+        prow.addWidget(self.qb_path, 1)
+        prow.addWidget(pick)
+        ql.addLayout(prow)
+        orow = QHBoxLayout()
         self.open_qb_btn = QPushButton("Open qBittorrent")
         self.open_qb_btn.setToolTip("Open qBittorrent (Web UI or app).")
         self.open_qb_btn.clicked.connect(self._open_qb)
-        v.addWidget(self.open_qb_btn)
+        orow.addWidget(self.open_qb_btn)
+        orow.addStretch()
+        ql.addLayout(orow)
+        v.addWidget(qb_card)
+
+        # --- appearance ---
+        app_card, al = card("Appearance")
+        self.light_theme = QCheckBox("Light theme")
+        self.light_theme.setToolTip("Toggle between light and dark themes.")
+        self.light_theme.setChecked(self.prefs.get("theme") == "light")
+        self.light_theme.toggled.connect(lambda on: self._apply_theme(not on))
+        al.addWidget(self.light_theme)
+        v.addWidget(app_card)
 
         v.addStretch()
-        self.tabs.addTab(w, "Settings")
-
-    # -----------------------------------------------------------------
-    def _init_log_dock(self):
-        self.log_dock = QDockWidget("Logs", self)
-        self.log_text = QTextEdit(); self.log_text.setReadOnly(True)
-        self.log_dock.setWidget(self.log_text)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.log_dock)
-        self.log_dock.show()
+        self.tabs.addTab(page, "Preferences")
 
     # -----------------------------------------------------------------
     # Config load/save
@@ -469,6 +646,7 @@ class TorrentAutomatorGUI(QMainWindow):
         except Exception as e:
             self._log(f"❌ Failed to load config: {e}")
             self.config = {}
+            self._status("Could not load config.yaml (copy config.example.yaml to config.yaml)")
             return
 
         self.user_edit.setText(self.config.get("anilist_username", ""))
@@ -477,6 +655,11 @@ class TorrentAutomatorGUI(QMainWindow):
 
         codec = (self.config.get("codec") or "").strip()
         self.codec_combo.setCurrentText(codec if codec else "Any")
+
+        # refresh dropdown lists from prefs
+        self.grp_combo.clear()
+        self.grp_combo.addItem("(none)")
+        self.grp_combo.addItems(self.prefs["groups"])
 
         # group mode
         if self.config.get("preferred_group"):
@@ -487,13 +670,7 @@ class TorrentAutomatorGUI(QMainWindow):
             self.prefs["group_mode"] = "priority"
             self.grp_mode_prio.setChecked(True)
 
-        # refresh dropdown lists from prefs
-        self.grp_combo.clear()
-        self.grp_combo.addItem("(none)")
-        self.grp_combo.addItems(self.prefs["groups"])
-
-        shows = self.config.get("shows", [])
-        self.shows_box.setText("\n".join(shows))
+        self._refresh_shows_list()
 
         self.recent_count_spin.setValue(int(self.config.get("recent_count", 5) or 5))
         self._refresh_recent_groups()
@@ -517,7 +694,11 @@ class TorrentAutomatorGUI(QMainWindow):
             self.recent_codec_combo.setCurrentText(recent_codec if recent_codec else "(use global)")
         self.recent_episode_edit.setText((self.config.get("recent_episode") or "").strip())
 
-        self.status_lbl.setText("Config loaded ✅")
+        self.config_dirty = False
+        self._update_dirty_ui()
+        self._update_group_summary()
+        self._update_recent_summary()
+        self._status("Config loaded")
         self._log("✅ Config loaded")
 
     def _save_config(self, save_to_disk: bool = True):
@@ -575,11 +756,59 @@ class TorrentAutomatorGUI(QMainWindow):
             with open(self.config_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(self.config, f, sort_keys=False, allow_unicode=True)
             self._log("💾 Config saved")
-            self.status_lbl.setText("Saved ✅")
+            self._status("Config saved")
             self.config_dirty = False
+            self._update_dirty_ui()
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save config:\n{e}")
             self._log(f"❌ Save error: {e}")
+
+    # -----------------------------------------------------------------
+    # Show metadata (covers) helpers
+    # -----------------------------------------------------------------
+    def _remember_meta(self, key: str, info: dict):
+        if not key or not info.get("cover"):
+            return
+        self.prefs["show_meta"][key.lower()] = {
+            "cover": info.get("cover", ""),
+            "color": info.get("color", "") or "",
+            "title": info.get("title", "") or key,
+        }
+
+    def _meta_for(self, show: str) -> dict:
+        meta = self.prefs.get("show_meta", {})
+        k = (show or "").lower()
+        if k in meta:
+            return meta[k]
+        norm = normalize_show_name(show)
+        best, best_score = None, 0.0
+        for mk, mv in meta.items():
+            s = SequenceMatcher(None, norm, normalize_show_name(mk)).ratio()
+            if s > best_score:
+                best, best_score = mv, s
+        return best if best and best_score > 0.85 else {}
+
+    def _refresh_shows_list(self):
+        self.shows_list.clear()
+        shows = self.config.get("shows", []) or []
+        watching = {pretty_title(k).lower() for k in self.anilist_data}
+        for s in shows:
+            m = self._meta_for(s)
+            sub = ""
+            if self.anilist_data and s.lower() not in watching:
+                sub = "Not on Watching list"
+            self.shows_list.add_show(s, s, sub, m.get("cover", ""), m.get("color", ""))
+        self.my_shows_title.setText(f"My shows ({len(shows)})")
+        self._update_batch_summary()
+        self._refresh_badges()
+
+    def _refresh_badges(self):
+        if not hasattr(self, "anilist_grid"):
+            return
+        shows = {s.lower() for s in self.config.get("shows", []) or []}
+        for it in self.anilist_grid.items():
+            it.setData(Qt.ItemDataRole.UserRole + 5, "In my shows" if (it.data(ROLE_KEY) or "").lower() in shows else "")
+        self.anilist_grid.viewport().update()
 
     # -----------------------------------------------------------------
     # AniList + shows
@@ -587,55 +816,147 @@ class TorrentAutomatorGUI(QMainWindow):
     def _fetch_anilist(self):
         user = self.user_edit.text().strip()
         if not user:
-            QMessageBox.warning(self, "AniList", "Set AniList username first")
+            QMessageBox.warning(self, "AniList", "Set your AniList username first.")
+            self.user_edit.setFocus()
             return
         self.fetch_btn.setEnabled(False)
-        worker = AniListWorker(user)
+        self.fetch_btn.setText("Fetching…")
+        worker = AsyncWorker(fetch_anilist_progress, user)
         worker.signals.result.connect(self._on_anilist)
         worker.signals.error.connect(lambda e: self._log(f"❌ AniList: {e}"))
-        worker.signals.finished.connect(lambda: self.fetch_btn.setEnabled(True))
+
+        def done():
+            self.fetch_btn.setEnabled(True)
+            self.fetch_btn.setText("Fetch AniList")
+        worker.signals.finished.connect(done)
         self.thread_pool.start(worker)
         self._log(f"🔗 Fetching AniList for {user}")
+        self._status(f"Fetching AniList for {user}…")
 
     def _on_anilist(self, data: dict):
-        self.anilist_list.clear()
+        data = data or {}
+        self.anilist_data = data
+        self.anilist_grid.clear()
         self.anilist_titles = []
         for k, v in sorted(data.items()):
-            prog = v.get("progress", 0); eps = v.get("episodes") or "?"
+            prog = v.get("progress", 0)
+            eps = v.get("episodes")
             t = pretty_title(k)
             self.anilist_titles.append(t)
-            it = QListWidgetItem(f"{t} — Ep {prog}/{eps}")
-            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            it.setCheckState(Qt.CheckState.Unchecked)
-            it.setData(Qt.ItemDataRole.UserRole, t)
-            self.anilist_list.addItem(it)
-        self.status_lbl.setText(f"Fetched {len(data)} titles ✅")
+            self._remember_meta(t, v)
+            frac = (prog / eps) if eps else None
+            sub = f"Ep {prog} / {eps if eps else '?'}"
+            if v.get("format"):
+                sub += f" · {v['format']}"
+            self.anilist_grid.add_card(t, v.get("title") or t, sub, v.get("cover", ""), v.get("color", ""),
+                                       progress=frac, info=v)
+        save_prefs(self.prefs)
+        self.anilist_filter.clear()
+        self.anilist_empty.setVisible(not data)
+        if not data:
+            self.anilist_empty.setText("No shows found. Check the username, and that the list is public "
+                                       "and has shows marked as Watching.")
+        self._refresh_shows_list()
+        self._update_add_btn()
+        self._status(f"Fetched {len(data)} titles from AniList")
+        self._log(f"✅ Fetched {len(data)} AniList titles")
 
-    def _set_all_checks(self, on: bool):
-        st = Qt.CheckState.Checked if on else Qt.CheckState.Unchecked
-        for i in range(self.anilist_list.count()):
-            self.anilist_list.item(i).setCheckState(st)
+    def _update_add_btn(self):
+        n = len(self.anilist_grid.checked_items())
+        self.add_selected.setEnabled(n > 0)
+        self.add_selected.setText(f"Add {n} to my shows" if n else "Add to my shows")
+
+    def _add_shows(self, names: List[str]) -> int:
+        shows = list(self.config.get("shows", []) or [])
+        existing = {s.lower() for s in shows}
+        added = 0
+        for n in names:
+            if n and n.lower() not in existing:
+                shows.append(n)
+                existing.add(n.lower())
+                added += 1
+        self.config["shows"] = sorted(shows, key=str.lower)
+        self._refresh_shows_list()
+        if added:
+            self._mark_dirty()
+        return added
 
     def _add_selected(self):
-        shows = set(self.config.get("shows", []))
-        for i in range(self.anilist_list.count()):
-            it = self.anilist_list.item(i)
-            if it.checkState() == Qt.CheckState.Checked:
-                shows.add(it.data(Qt.ItemDataRole.UserRole))
-        self.config["shows"] = sorted(shows)
-        self.shows_box.setText("\n".join(self.config["shows"]))
-        self._log(f"➕ Added shows ({len(self.config['shows'])})")
+        names = [it.data(ROLE_KEY) for it in self.anilist_grid.checked_items()]
+        added = self._add_shows(names)
+        self.anilist_grid.set_all_checked(False, visible_only=False)
+        self._log(f"➕ Added {added} show(s) ({len(self.config['shows'])} total)")
+        self._status(f"Added {added} show(s) to My shows (not saved yet)")
+
+    def _browse_dialog(self, title: str, note: str, existing: set) -> List[dict]:
+        dlg = AniListBrowseDialog(self, search_fn=search_anilist, title=title, note=note,
+                                  existing=existing, key_fn=pretty_title)
+        if not dlg.exec():
+            return []
+        picked = dlg.selected()
+        for info in picked:
+            self._remember_meta(info["key"], info)
+        save_prefs(self.prefs)
+        return picked
+
+    def _browse_for_config(self):
+        picked = self._browse_dialog("Add shows to My shows", BATCH_NOTE,
+                                     set(self.config.get("shows", []) or []))
+        if not picked:
+            return
+        added = self._add_shows([p["key"] for p in picked])
+        self._log(f"➕ Added {added} show(s) from AniList search")
+        if self.anilist_data:
+            watching = {pretty_title(k).lower() for k in self.anilist_data}
+            missing = [p["key"] for p in picked if p["key"].lower() not in watching]
+            if missing:
+                self._log("⚠️ Not on your Watching list (batch will skip them): " + ", ".join(missing))
+
+    def _browse_for_recent(self):
+        picked = self._browse_dialog("Add shows to Recent Releases", "",
+                                     set(self.recent_show_list.keys()))
+        for p in picked:
+            self._add_recent_show_item(p["key"], checked=True)
+        if picked:
+            self._mark_dirty()
+            self._update_recent_summary()
+
+    def _remove_selected_shows(self):
+        sel = [it.data(ROLE_KEY) for it in self.shows_list.selectedItems()]
+        if not sel:
+            self._status("Select shows in My shows to remove them")
+            return
+        self.config["shows"] = [s for s in self.config.get("shows", []) if s not in sel]
+        self._refresh_shows_list()
+        self._log(f"🗑️ Removed {len(sel)} show(s)")
         self._mark_dirty()
 
     def _clear_shows(self):
+        if not self.config.get("shows"):
+            return
+        res = QMessageBox.question(self, "Clear all shows",
+                                   f"Remove all {len(self.config['shows'])} shows from My shows?")
+        if res != QMessageBox.StandardButton.Yes:
+            return
         self.config["shows"] = []
-        self.shows_box.clear()
+        self._refresh_shows_list()
         self._log("🗑️ Cleared all shows")
         self._mark_dirty()
 
     # -----------------------------------------------------------------
     # Groups management
     # -----------------------------------------------------------------
+    def _refresh_group_combo(self, keep: str | None = None):
+        cur = keep if keep is not None else self.grp_combo.currentText()
+        self.grp_combo.blockSignals(True)
+        self.grp_combo.clear()
+        self.grp_combo.addItem("(none)")
+        self.grp_combo.addItems(self.prefs["groups"])
+        if cur in ["(none)"] + self.prefs["groups"]:
+            self.grp_combo.setCurrentText(cur)
+        self.grp_combo.blockSignals(False)
+        self._update_group_summary()
+
     def _add_group(self):
         text, ok = QInputDialog.getText(self, "Add Group", "Group name:")
         if not ok or not text.strip():
@@ -644,7 +965,7 @@ class TorrentAutomatorGUI(QMainWindow):
         if name not in self.prefs["groups"]:
             self.prefs["groups"].append(name)
             save_prefs(self.prefs)
-            self.grp_combo.addItem(name)
+            self._refresh_group_combo(keep=name)
             self._refresh_recent_groups()
             self._log(f"➕ Group added: {name}")
         self._mark_dirty()
@@ -654,27 +975,47 @@ class TorrentAutomatorGUI(QMainWindow):
         if g and g != "(none)" and g in self.prefs["groups"]:
             self.prefs["groups"].remove(g)
             save_prefs(self.prefs)
-            self.grp_combo.clear()
-            self.grp_combo.addItem("(none)")
-            self.grp_combo.addItems(self.prefs["groups"])
+            self._refresh_group_combo(keep="(none)")
             self._refresh_recent_groups()
             self._log(f"🗑️ Group removed: {g}")
             self._mark_dirty()
 
     def _reorder_groups(self):
-        dlg = GroupReorderDialog(self.prefs["groups"])
+        dlg = GroupReorderDialog(self.prefs["groups"], self)
         if dlg.exec():
             self.prefs["groups"] = dlg.get_order()
             save_prefs(self.prefs)
-            # refresh dropdown
-            cur = self.grp_combo.currentText()
-            self.grp_combo.clear(); self.grp_combo.addItem("(none)")
-            self.grp_combo.addItems(self.prefs["groups"])
-            if cur in ["(none)"] + self.prefs["groups"]:
-                self.grp_combo.setCurrentText(cur)
+            self._refresh_group_combo()
             self._refresh_recent_groups()
             self._log("✅ Group priority updated")
             self._mark_dirty()
+
+    def _update_group_summary(self):
+        if not hasattr(self, "group_summary"):
+            return
+        if self.grp_mode_single.isChecked():
+            g = self.grp_combo.currentText()
+            txt = (f"Only releases from <b>{g}</b> will be selected." if g and g != "(none)"
+                   else "No group selected: any group will be accepted.")
+        else:
+            groups = self.prefs.get("groups") or []
+            txt = ("Priority: " + " &gt; ".join(f"<b>{g}</b>" for g in groups)) if groups \
+                else "No groups configured: any group will be accepted."
+        self.group_summary.setText(txt)
+        self._update_batch_summary()
+
+    def _update_batch_summary(self):
+        if not hasattr(self, "batch_summary") or not hasattr(self, "grp_mode_single"):
+            return
+        n = len(self.config.get("shows", []) or [])
+        if self.grp_mode_single.isChecked():
+            g = self.grp_combo.currentText()
+            grp = g if g and g != "(none)" else "any group"
+        else:
+            grp = " > ".join(self.prefs.get("groups") or []) or "any group"
+        q = self.qual_combo.currentText() or "Any"
+        c = self.codec_combo.currentText() or "Any"
+        self.batch_summary.setText(f"{n} show(s) · {q} · {c} · {grp}")
 
     # -----------------------------------------------------------------
     # Recent releases helpers
@@ -683,26 +1024,28 @@ class TorrentAutomatorGUI(QMainWindow):
         name = (name or "").strip()
         if not name:
             return
-        for i in range(self.recent_show_list.count()):
-            if self.recent_show_list.item(i).text() == name:
-                if checked:
-                    self.recent_show_list.item(i).setCheckState(Qt.CheckState.Checked)
-                return
-        it = QListWidgetItem(name)
-        it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-        self.recent_show_list.addItem(it)
+        existing = self.recent_show_list.find_key(name)
+        if existing is not None:
+            if checked:
+                existing.setCheckState(Qt.CheckState.Checked)
+            return
+        m = self._meta_for(name)
+        self.recent_show_list.add_show(name, name, "", m.get("cover", ""), m.get("color", ""), checked=checked)
 
     def _set_recent_shows(self, shows: List[str], checked: bool = True, append: bool = False, mark_dirty: bool = True):
+        self.recent_show_list.blockSignals(True)
         if not append:
             self.recent_show_list.clear()
         for s in shows or []:
             self._add_recent_show_item(s, checked=checked)
+        self.recent_show_list.blockSignals(False)
+        self._update_recent_summary()
         if mark_dirty:
             self._mark_dirty()
 
     def _clear_recent_shows(self):
         self.recent_show_list.clear()
+        self._update_recent_summary()
         self._mark_dirty()
 
     def _add_recent_show_from_input(self):
@@ -711,15 +1054,16 @@ class TorrentAutomatorGUI(QMainWindow):
             return
         self._add_recent_show_item(name, checked=True)
         self.recent_add_edit.clear()
+        self._update_recent_summary()
         self._mark_dirty()
 
     def _get_recent_shows(self) -> List[str]:
-        shows: List[str] = []
-        for i in range(self.recent_show_list.count()):
-            it = self.recent_show_list.item(i)
-            if it.checkState() == Qt.CheckState.Checked:
-                shows.append(it.text())
-        return shows
+        return self.recent_show_list.keys(checked_only=True)
+
+    def _update_recent_summary(self):
+        if hasattr(self, "recent_summary"):
+            n = len(self._get_recent_shows())
+            self.recent_summary.setText(f"{n} show(s) selected" if n else "No shows selected")
 
     def _refresh_recent_groups(self):
         current = self.recent_group_combo.currentText()
@@ -746,30 +1090,113 @@ class TorrentAutomatorGUI(QMainWindow):
         self._log(f"Loaded {len(self.prefs['nyaa_groups'])} popular groups.")
 
     # -----------------------------------------------------------------
-    # Automation
+    # Automation: plan -> confirm -> execute
     # -----------------------------------------------------------------
+    def _set_busy(self, busy: bool, which: str = ""):
+        self.busy = busy
+        self.run_btn.setEnabled(not busy)
+        self.run_recent_btn.setEnabled(not busy)
+        if busy:
+            (self.status_batch if which == "batch" else self.status_recent).setText("Working…")
+
+    def _status_label(self, kind: str) -> QLabel:
+        return self.status_batch if kind == "batch" else self.status_recent
+
     def _run_recent(self):
-        self._log("Starting recent releases fetch...")
-        self.status_recent.setText("Running (recent)")
+        if self.busy:
+            return
         self._save_config(save_to_disk=False)
-        worker = RecentWorker(self.config)
-        worker.signals.line.connect(self._log)
-        worker.signals.done.connect(lambda: self.status_recent.setText("Done"))
-        self.thread_pool.start(worker)
+        if not self.config.get("recent_shows"):
+            QMessageBox.information(self, "Recent releases", "Tick at least one show first.")
+            return
+        if not self._has_qb_config():
+            return
+        self._log("🔎 Looking for recent releases…")
+        self._start_plan("recent", build_recent_plan, dict(self.config))
 
     def _run_automation(self):
-        self._log("▶ Starting automation...")
-        self.status_batch.setText("Running...")
+        if self.busy:
+            return
         self._save_config(save_to_disk=False)
-        worker = AutomationWorker(self.config)
+        if not self.config.get("shows"):
+            QMessageBox.information(self, "Batch automation", "Add some shows to My shows first.")
+            return
+        if not (self.config.get("anilist_username") or "").strip():
+            QMessageBox.information(self, "Batch automation",
+                                    "Batch automation needs your AniList username to know which "
+                                    "episodes you have watched.")
+            return
+        if not self._has_qb_config():
+            return
+        self._log("▶ Checking for new episodes…")
+        self._start_plan("batch", build_batch_plan, dict(self.config))
+
+    def _has_qb_config(self) -> bool:
+        if not isinstance(self.config.get("qbittorrent"), dict):
+            QMessageBox.warning(self, "qBittorrent", "config.yaml has no qbittorrent section. "
+                                "Copy it from config.example.yaml.")
+            return False
+        return True
+
+    def _start_plan(self, kind: str, fn, config: dict):
+        self._set_busy(True, kind)
+        self._status("Searching Nyaa… nothing will be downloaded until you confirm")
+        worker = AsyncWorker(fn, config, pass_log=True)
         worker.signals.line.connect(self._log)
-        worker.signals.done.connect(lambda: self.status_batch.setText("Done ✅"))
+        worker.signals.result.connect(lambda plan, k=kind, cfg=config: self._on_plan(k, plan, cfg))
+        worker.signals.error.connect(lambda e, k=kind: self._on_plan_error(k, e))
+        self.thread_pool.start(worker)
+
+    def _on_plan_error(self, kind: str, err: str):
+        self._log(f"❌ Error: {err}")
+        self._set_busy(False)
+        self._status_label(kind).setText("Failed")
+
+    def _on_plan(self, kind: str, plan, config: dict):
+        self._set_busy(False)
+        if plan is None or plan.error:
+            self._status_label(kind).setText("Nothing to do")
+            return
+        # fill in covers we know about (recent releases do not query AniList)
+        for sp in plan.shows:
+            if not sp.cover:
+                m = self._meta_for(sp.show)
+                sp.cover, sp.color = m.get("cover", ""), m.get("color", "")
+        for line in format_plan(plan):
+            self._log(line)
+
+        dlg = ConfirmDownloadDialog(plan, self)
+        if not dlg.exec():
+            self._log("⏭️ Cancelled, nothing was sent to qBittorrent.")
+            self._status_label(kind).setText("Cancelled")
+            self._status("Cancelled, nothing downloaded")
+            return
+        chosen = dlg.chosen()
+        if not chosen:
+            self._status_label(kind).setText("Nothing selected")
+            return
+        self._log(f"⬇ Sending {len(chosen)} torrent(s) to qBittorrent…")
+        self._set_busy(True, kind)
+        worker = AsyncWorker(execute_plan_items, chosen, config, pass_log=True)
+        worker.signals.line.connect(self._log)
+
+        def done(summary, k=kind):
+            self._set_busy(False)
+            summary = summary or {}
+            msg = f"Sent {summary.get('sent', 0)}, failed {summary.get('failed', 0)}"
+            self._status_label(k).setText(msg)
+            self._status(msg)
+        worker.signals.result.connect(done)
+        worker.signals.error.connect(lambda e, k=kind: self._on_plan_error(k, e))
         self.thread_pool.start(worker)
 
     def _open_qb(self):
         if self.prefs.get("use_web_ui", False):
-            webbrowser.open("http://localhost:8080")
-            self._log("🌐 Opened qBittorrent Web UI")
+            qbc = self.config.get("qbittorrent") or {}
+            scheme = "https" if qbc.get("https") else "http"
+            url = f"{scheme}://{qbc.get('host') or 'localhost'}:{qbc.get('port') or 8080}"
+            webbrowser.open(url)
+            self._log(f"🌐 Opened qBittorrent Web UI ({url})")
         else:
             path = self.prefs.get("qbittorrent_path") or "qbittorrent"
             try:
@@ -795,32 +1222,39 @@ class TorrentAutomatorGUI(QMainWindow):
     # Misc helpers
     # -----------------------------------------------------------------
     def _show_help_popup(self):
-        dlg = QDialog(self, flags=Qt.WindowType.Popup)
-        dlg.setWindowTitle("How to use")
-        layout = QVBoxLayout(dlg)
-        title = QLabel(f"Torrent Automator GUI v{APP_VERSION}")
-        body = QLabel(
-            "Capabilities:\n"
-            "- Fetch AniList shows and add them to your config\n"
-            "- Run batch automation for configured shows\n"
-            "- Fetch recent releases for selected shows\n\n"
-            "Tips:\n"
-            "- Use the Config tab to manage shows and groups\n"
-            "- Use Recent Releases for quick backfill or single-episode grabs\n"
-            "- Check Logs for real-time output"
+        QMessageBox.information(
+            self, "How to use",
+            f"AniTorrent Sync v{APP_VERSION}\n\n"
+            "Library\n"
+            "  • Enter your AniList username and Fetch AniList to see your Watching list.\n"
+            "  • Click covers to select shows, then add them to My shows.\n"
+            "  • Browse AniList to search for any show.\n"
+            "  • 'Check for new episodes' finds episodes after your AniList progress.\n\n"
+            "Recent Releases\n"
+            "  • Grab the latest releases for any shows, optionally for one episode.\n\n"
+            "Before anything is downloaded you'll see a review screen listing every release, "
+            "the group it comes from and which other groups have it. Untick anything you don't want.\n\n"
+            "Preferences holds quality, codec, release groups and qBittorrent options."
         )
-        body.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(body)
-        dlg.setLayout(layout)
-        dlg.adjustSize()
-        dlg.show()
+
+    def _status(self, message: str):
+        if hasattr(self, "status_msg"):
+            self.status_msg.setText(message)
 
     def _log(self, message: str):
         self.log_text.append(message)
 
     def _mark_dirty(self, *args):
         self.config_dirty = True
+        self._update_dirty_ui()
+        self._update_batch_summary()
+
+    def _update_dirty_ui(self):
+        if hasattr(self, "save_btn"):
+            self.save_btn.setText("Save config •" if self.config_dirty else "Save config")
+            self.save_btn.setObjectName("Primary" if self.config_dirty else "")
+            self.save_btn.style().unpolish(self.save_btn)
+            self.save_btn.style().polish(self.save_btn)
 
     def closeEvent(self, event):
         if self.config_dirty:
@@ -832,15 +1266,20 @@ class TorrentAutomatorGUI(QMainWindow):
             if res == QMessageBox.StandardButton.Yes:
                 self._save_config()
                 if self.config_dirty:
-                    event.ignore(); return
+                    event.ignore()
+                    return
             elif res == QMessageBox.StandardButton.Cancel:
-                event.ignore(); return
+                event.ignore()
+                return
         save_prefs(self.prefs)
         event.accept()
+
 
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    if "Fusion" in QStyleFactory.keys():
+        app.setStyle("Fusion")
     window = TorrentAutomatorGUI()
     window.show()
     sys.exit(app.exec())
