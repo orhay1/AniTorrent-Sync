@@ -78,6 +78,7 @@ class GuiFirstRunTests(unittest.TestCase):
 
     def _gui(self, load_side_effect):
         import gui
+        gui.TorrentAutomatorGUI.AUTO_FETCH = False
         for p in (mock.patch.object(gui, "load_prefs", return_value={}),
                   mock.patch.object(gui, "save_prefs"),
                   mock.patch.object(gui, "load_config_with_report", side_effect=load_side_effect)):

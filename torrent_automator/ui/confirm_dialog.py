@@ -1,6 +1,8 @@
 """Confirmation step shown before anything is sent to qBittorrent."""
 from __future__ import annotations
 
+import html
+
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QIcon, QColor, QFont, QBrush
 from PyQt6.QtWidgets import (
@@ -97,8 +99,15 @@ class ConfirmDownloadDialog(QDialog):
         found = sorted({g for sp in plan.shows for g in sp.groups_found}, key=str.lower)
         if found:
             sel = {g.lower() for g in plan.groups}
-            avail = QLabel("Groups available in search results: " + ", ".join(
-                f"<b>{g}</b>" if g.lower() in sel else g for g in found))
+            # your selected groups first, then the rest; long lists are cut short (full list in the tooltip)
+            ordered = [g for g in found if g.lower() in sel] + [g for g in found if g.lower() not in sel]
+            limit = 15
+            shown = ", ".join(f"<b>{html.escape(g)}</b>" if g.lower() in sel else html.escape(g)
+                              for g in ordered[:limit])
+            if len(ordered) > limit:
+                shown += f" … and {len(ordered) - limit} more"
+            avail = QLabel(f"Groups available in search results ({len(found)}): {shown}")
+            avail.setToolTip(", ".join(found))
             avail.setObjectName("Hint")
             avail.setWordWrap(True)
             avail.setTextFormat(Qt.TextFormat.RichText)
@@ -156,7 +165,11 @@ class ConfirmDownloadDialog(QDialog):
                 child = QTreeWidgetItem(top)
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.CheckState.Checked if it.selected else Qt.CheckState.Unchecked)
-                child.setText(0, f"Episode {it.episode}" if it.episode else "Episode ?")
+                if getattr(it, "is_batch", False):
+                    child.setText(0, f"Season batch ({it.episode})" if it.episode != "all" else "Season batch")
+                    child.setToolTip(0, "One torrent containing the whole season")
+                else:
+                    child.setText(0, f"Episode {it.episode}" if it.episode else "Episode ?")
                 child.setText(1, it.group or "?")
                 if not it.in_selected_groups:
                     child.setForeground(1, warn)

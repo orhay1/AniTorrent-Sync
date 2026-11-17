@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QStyleFactory, QScrollArea,
 )
 from PyQt6.QtGui import QAction, QKeySequence
-from PyQt6.QtCore import Qt, QThreadPool
+from PyQt6.QtCore import Qt, QThreadPool, QTimer
 
 import yaml
 
@@ -167,6 +167,9 @@ class GroupReorderDialog(QDialog):
 # GUI MainWindow
 # ---------------------------------------------------------------------
 class TorrentAutomatorGUI(QMainWindow):
+    # Load the AniList Watching list on startup when a username is saved (tests turn this off).
+    AUTO_FETCH = True
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AniTorrent Sync")
@@ -217,6 +220,8 @@ class TorrentAutomatorGUI(QMainWindow):
         self.statusBar().addWidget(self.status_msg, 1)
 
         self._load_config()
+        if self.AUTO_FETCH and self.user_edit.text().strip():
+            QTimer.singleShot(0, self._fetch_anilist)
 
     # -----------------------------------------------------------------
     # Chrome: header, menus, logs

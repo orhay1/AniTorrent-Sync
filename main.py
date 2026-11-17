@@ -63,9 +63,47 @@ def is_batch_release(title: str) -> bool:
         return True
     if re.search(r"\b\d{1,3}\s*~\s*\d{1,3}\b", t):
         return True
+    if re.search(r"\bs\d{1,2}e\d{1,3}\s?-\s?e?\d{1,3}\b", t):  # S02E07-11 / S02E07-E11
+        return True
     if re.search(r"(?:^|[\s\[(])\d{2,3}\s?-\s?\d{2,3}(?![\w.])", t):
         return True
     return False
+
+
+def batch_episode_range(title: str) -> str | None:
+    """"01 ~ 12" -> "01–12" for a batch title, or None."""
+    # lookahead so overlapping candidates are all tried ("2 - 01 ~ 10" -> "01 ~ 10")
+    for m in re.finditer(r"(?=\b(\d{1,3})\s*[~\-]\s*(\d{1,3})\b)", (title or "").replace("～", "~")):
+        a, b = int(m.group(1)), int(m.group(2))
+        if b > a and m.group(2) not in ("264", "265"):  # not "x264-265"
+            return f"{m.group(1).zfill(2)}–{m.group(2).zfill(2)}"
+    return None
+
+
+def _batch_matches_season(title: str, current_season: int, season_total: int | None) -> bool:
+    """Reject batches for another season (e.g. a Season 1 pack for a Season 2 show)."""
+    sn = extract_season_number(title)
+    if sn is not None and sn != current_season:
+        return False
+    rng = batch_episode_range(title)
+    if rng and season_total:
+        end = int(rng.split("–")[1])
+        if end > season_total:
+            return False
+    return True
+
+
+def _ranges(nums) -> str:
+    """[2,3,4,7] -> "2–4, 7"."""
+    nums = sorted(set(nums))
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(str(nums[i]) if i == j else f"{nums[i]}–{nums[j]}")
+        i = j + 1
+    return ", ".join(out)
 
 
 def anilist_season_number(title: str) -> int | None:
@@ -288,13 +326,18 @@ async def build_batch_plan(config: dict, log_cb: LogFn = None, anilist: dict | N
             continue
         sp.groups_found = unique(r["group"] for r in raw)
 
-        # Bucket every newer episode (from any group) by (season, episode)
+        finished = (info.get("status") or "") in ("FINISHED", "CANCELLED")
+
+        # Bucket every newer episode (from any group) by (season, episode).
+        # Batch packs are skipped for airing shows; for finished shows they are
+        # collected, because old single episodes often aren't in Nyaa's results.
         buckets: dict[tuple[int, int], list[dict]] = {}
         ep_labels: dict[tuple[int, int], str] = {}
-        skipped_batches = 0
+        batches: list[dict] = []
         for r in raw:
             if is_batch_release(r["title"]):
-                skipped_batches += 1  # batch automation grabs single episodes only
+                if finished and _batch_matches_season(r["title"], current_season, season_total):
+                    batches.append(r)
                 continue
             ep_s = extract_episode_number(r["title"])
             ep = _episode_int(ep_s)
@@ -311,9 +354,12 @@ async def build_batch_plan(config: dict, log_cb: LogFn = None, anilist: dict | N
             buckets.setdefault(key, []).append(r)
             ep_labels.setdefault(key, ep_s)
 
-        if not buckets:
+        if not buckets and not batches:
             sp.status = STATUS_NO_NEW if raw else STATUS_NO_RESULTS
             sp.message = "No new episodes found." if raw else "No releases found on Nyaa."
+            if finished and season_total and prog < season_total and raw:
+                sp.message = (f"Episodes {_ranges(range(prog + 1, season_total + 1))} "
+                              "weren't found on Nyaa.")
             emit(f"⏭️ No new episodes for {show}")
             continue
 
@@ -339,16 +385,53 @@ async def build_batch_plan(config: dict, log_cb: LogFn = None, anilist: dict | N
                 available_groups=available,
             ))
 
-        n_ok = sum(1 for it in sp.items if it.in_selected_groups)
-        n_other = len(sp.items) - n_ok
-        if n_ok:
+        batch_item = None
+        if batches:
+            allowed_b = [r for r in batches if in_groups(r["title"], groups)]
+            if allowed_b:
+                best_b = min(allowed_b, key=lambda r: score_result(r["title"], groups)) if groups else allowed_b[0]
+            else:
+                best_b = batches[0]
+            batch_item = PlannedTorrent(
+                show=show,
+                title=best_b["title"],
+                link=best_b["link"],
+                group=best_b.get("group") or release_group(best_b["title"]),
+                episode=batch_episode_range(best_b["title"]) or "all",
+                season=current_season,
+                in_selected_groups=bool(allowed_b),
+                selected=bool(allowed_b),
+                available_groups=unique(r["group"] for r in batches),
+                is_batch=True,
+            )
+            if batch_item.selected:
+                # the season pack replaces the single episodes (still listed, unticked)
+                for it in sp.items:
+                    it.selected = False
+            sp.items.insert(0, batch_item)
+
+        singles_ok = sum(1 for it in sp.items if it.in_selected_groups and not it.is_batch)
+        singles_other = sum(1 for it in sp.items if not it.in_selected_groups and not it.is_batch)
+        if batch_item is not None and batch_item.selected:
             sp.status = STATUS_READY
-            sp.message = f"{n_ok} new episode(s) ready."
+            sp.message = "Season batch ready (single episodes listed below, unticked)."
+        elif singles_ok:
+            sp.status = STATUS_READY
+            sp.message = f"{singles_ok} new episode(s) ready."
+            if singles_other:
+                sp.message += f" {singles_other} more only available from other groups."
         else:
             sp.status = STATUS_GROUPS_UNAVAILABLE
             sp.message = "New episodes exist, but not from your selected group(s)."
-        if n_ok and n_other:
-            sp.message += f" {n_other} more only available from other groups."
+        if batch_item is not None and not batch_item.selected:
+            sp.message += " A season batch from another group is listed."
+
+        # For finished shows, say which episodes Nyaa didn't return at all
+        if finished and season_total and not (batch_item and batch_item.selected):
+            found = {k[1] for k in buckets}
+            missing = [e for e in range(prog + 1, season_total + 1) if e not in found]
+            if missing:
+                sp.message += f" Not found on Nyaa: episode(s) {_ranges(missing)}."
 
     return plan
 

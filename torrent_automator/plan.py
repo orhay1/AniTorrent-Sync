@@ -31,6 +31,8 @@ class PlannedTorrent:
     selected: bool = True
     # Every group that has a release for this same episode in the search results.
     available_groups: list[str] = field(default_factory=list)
+    # A multi-episode season pack (episode then holds a range like "01–12" or "all").
+    is_batch: bool = False
 
 
 @dataclass
@@ -108,7 +110,8 @@ def format_plan(plan: DownloadPlan) -> list[str]:
             lines.append(f"    Groups found: {', '.join(sp.groups_found)}")
         for it in sp.items:
             mark = "[x]" if it.selected else "[ ]"
-            ep = f"Ep {it.episode}" if it.episode else "Ep ?"
+            ep = (f"Batch {it.episode}" if it.is_batch
+                  else f"Ep {it.episode}" if it.episode else "Ep ?")
             note = "" if it.in_selected_groups else "  (not in selected groups)"
             lines.append(f"    {mark} {ep}: {it.title}{note}")
     selected = plan.selected_items()
