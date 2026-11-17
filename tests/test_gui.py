@@ -44,7 +44,7 @@ class GuiTests(unittest.TestCase):
         patches = [
             mock.patch.object(gui, "load_prefs", return_value={}),
             mock.patch.object(gui, "save_prefs"),
-            mock.patch.object(gui, "load_config", side_effect=lambda p: base_config(recent_shows=["Frieren"])),
+            mock.patch.object(gui, "load_config_with_report", side_effect=lambda p: (base_config(recent_shows=["Frieren"]), [])),
             mock.patch.object(main, "fetch_nyaa_rss", fake_rss),
             mock.patch.object(main, "extract_magnet", fake_magnet),
             mock.patch.object(main, "fetch_anilist_progress", mock.AsyncMock(return_value=ANILIST)),
