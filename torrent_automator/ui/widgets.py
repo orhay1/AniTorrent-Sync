@@ -11,6 +11,7 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QFontMetrics, QIcon, QPai
 from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QStyledItemDelegate, QStyle, QDialog, QVBoxLayout,
     QHBoxLayout, QLineEdit, QPushButton, QLabel, QListView, QAbstractItemView,
+    QScrollArea, QWidget, QSizePolicy, QFrame,
 )
 
 from .covers import CoverLoader, cover_or_placeholder, rounded
@@ -199,6 +200,50 @@ class CoverGrid(QListWidget):
         self.setItemDelegate(self._delegate)
         self.itemClicked.connect(self._toggle)
         CoverLoader.instance().coverReady.connect(self._on_cover)
+        self._auto_height = False
+        self._fit_pending = False
+
+    # --- auto height: grow to fit every card instead of scrolling (used inside
+    # GroupedCoverGrid, where the outer area scrolls) ---
+    def set_auto_height(self, on: bool = True):
+        self._auto_height = on
+        if on:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self.setStyleSheet("QListWidget { border: none; background: transparent; }")
+            self.schedule_fit()
+
+    def schedule_fit(self):
+        if self._auto_height and not self._fit_pending:
+            self._fit_pending = True
+            QTimer.singleShot(0, self._fit)
+
+    def _fit(self):
+        self._fit_pending = False
+        if not self._auto_height:
+            return
+        self.doItemsLayout()
+        bottom = -1
+        for it in self.items():
+            if not it.isHidden():
+                bottom = max(bottom, self.visualItemRect(it).bottom())
+        h = 0 if bottom < 0 else bottom + 2 * self.spacing() + 2 * self.frameWidth() + 4
+        if self.height() != h:
+            self.setFixedHeight(h)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.schedule_fit()
+
+    def wheelEvent(self, event):
+        if self._auto_height:
+            event.ignore()  # let the outer scroll area scroll
+            return
+        super().wheelEvent(event)
+
+    def visible_count(self) -> int:
+        return sum(1 for it in self.items() if not it.isHidden())
 
     def add_card(self, key: str, title: str, subtitle: str = "", cover: str = "", color: str = "",
                  badge: str = "", progress: float | None = None, checked: bool = False,
@@ -217,6 +262,7 @@ class CoverGrid(QListWidget):
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         self.addItem(it)
+        self.schedule_fit()
         return it
 
     def _toggle(self, it: QListWidgetItem):
@@ -251,10 +297,112 @@ class CoverGrid(QListWidget):
         for it in self.items():
             hay = f"{it.data(ROLE_TITLE)} {(it.data(ROLE_INFO) or {}).get('title_english', '')}".lower()
             it.setHidden(bool(t) and t not in hay)
+        self.schedule_fit()
 
     def _on_cover(self, url: str):
         if any(it.data(ROLE_COVER) == url for it in self.items()):
             self.viewport().update()
+
+    def refresh(self):
+        self.viewport().update()
+
+
+class GroupedCoverGrid(QScrollArea):
+    """
+    Cover cards split into titled sections (e.g. Behind / Finished / Caught up),
+    all in one scrollable page. Offers the same API as CoverGrid, plus a
+    `group` argument on add_card.
+    """
+    checkedChanged = pyqtSignal()
+
+    def __init__(self, groups: list[tuple[str, str, str]], card_width: int = 150, parent=None):
+        """groups: (key, title, description) in display order."""
+        super().__init__(parent)
+        self.setObjectName("GroupedGrid")
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.verticalScrollBar().setSingleStep(24)
+        body = QWidget()
+        body.setObjectName("Transparent")
+        self._layout = QVBoxLayout(body)
+        self._layout.setContentsMargins(0, 0, 4, 0)
+        self._layout.setSpacing(4)
+        self.sections: dict[str, dict] = {}
+        for key, title, desc in groups:
+            head = QHBoxLayout()
+            head.setContentsMargins(4, 8, 4, 0)
+            lbl = QLabel(title)
+            lbl.setObjectName("GroupTitle")
+            sub = QLabel(desc)
+            sub.setObjectName("Hint")
+            sel = QPushButton("Select all")
+            sel.setObjectName("Flat")
+            head.addWidget(lbl)
+            head.addSpacing(8)
+            head.addWidget(sub, 1)
+            head.addWidget(sel)
+            header = QWidget()
+            header.setObjectName("Transparent")
+            header.setLayout(head)
+            grid = CoverGrid(card_width=card_width)
+            grid.set_auto_height(True)
+            grid.checkedChanged.connect(self.checkedChanged)
+            sel.clicked.connect(lambda _=False, g=grid: g.set_all_checked(True))
+            self._layout.addWidget(header)
+            self._layout.addWidget(grid)
+            self.sections[key] = {"title": title, "label": lbl, "header": header, "grid": grid}
+        self._layout.addStretch(1)
+        self.setWidget(body)
+        self._default = groups[0][0] if groups else ""
+        self._update_headers()
+
+    def grids(self) -> list[CoverGrid]:
+        return [s["grid"] for s in self.sections.values()]
+
+    def add_card(self, key: str, title: str, *args, group: str | None = None, **kwargs):
+        sec = self.sections.get(group or self._default) or self.sections[self._default]
+        it = sec["grid"].add_card(key, title, *args, **kwargs)
+        self._update_headers()
+        return it
+
+    def clear(self):
+        for g in self.grids():
+            g.clear()
+            g.schedule_fit()
+        self._update_headers()
+
+    def items(self) -> list[QListWidgetItem]:
+        return [it for g in self.grids() for it in g.items()]
+
+    def count(self) -> int:
+        return sum(g.count() for g in self.grids())
+
+    def checked_items(self) -> list[QListWidgetItem]:
+        return [it for g in self.grids() for it in g.checked_items()]
+
+    def set_all_checked(self, on: bool, visible_only: bool = True):
+        for g in self.grids():
+            g.blockSignals(True)
+            g.set_all_checked(on, visible_only)
+            g.blockSignals(False)
+        self.checkedChanged.emit()
+
+    def filter(self, text: str):
+        for g in self.grids():
+            g.filter(text)
+        self._update_headers()
+
+    def refresh(self):
+        for g in self.grids():
+            g.refresh()
+
+    def _update_headers(self):
+        for sec in self.sections.values():
+            n = sec["grid"].visible_count()
+            sec["label"].setText(f"{sec['title']}  ·  {n}")
+            sec["header"].setVisible(n > 0)
+            sec["grid"].setVisible(n > 0)
 
 
 class ThumbList(QListWidget):

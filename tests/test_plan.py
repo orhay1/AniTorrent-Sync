@@ -67,6 +67,72 @@ def run(coro):
     return asyncio.run(coro)
 
 
+class ParsingTests(unittest.TestCase):
+    """Real release titles seen on Nyaa while testing."""
+
+    def test_episode_numbers(self):
+        cases = {
+            "[Erai-raws] Ao no Hako Season 2 - 04 [1080p NF WEBRip HEVC EAC3][MultiSub][BFC35CE3]": "04",
+            "[SubsPlease] Hotaru no Yomeiri - 05 (1080p) [7825FCC8].mkv": "05",
+            "Firefly Wedding S01E02 Tennyo Island 1080p CR WEB-DL MULTi AAC2.0 H.264-VARYG": "02",
+            "[Judas] Frieren - 04 [1080p][HEVC x265 10bit]": "04",
+            "[ASW] Frieren - 05v2 [1080p HEVC][BBBB].mkv": "05v2",
+            # bit depth used to be read as the episode (8 / 10)
+            "【TSDM字幕组】[学生会也有洞！][02][MP4][WEB-DL][AVC 8bit 1080p AAC][简日双语内嵌]": "02",
+            "【TSDM字幕组】[学生会也有洞！][02][MP4][WEB-DL][HEVC 10bit 1080p AAC][简日双语内嵌]": "02",
+            "[SubsPlease] Kaiju No. 8 - 07 (1080p) [ABCD1234].mkv": "07",
+            # the "2" in the show name used to win over the bracketed episode
+            "[绿茶字幕组] 赛博朋克：边缘行者 2 / Cyberpunk - Edgerunners 2 [03][WebRip][1080p][简繁日内封]": "03",
+            "[喵萌奶茶屋&LoliHouse] Cyberpunk Edgerunners 2 - 04 [WebRip 1080p HEVC-10bit AAC]": "04",
+        }
+        for title, ep in cases.items():
+            self.assertEqual(main.extract_episode_number(title), ep, title)
+        self.assertIsNone(main.extract_episode_number(
+            "[Raze-Salieri] Cyberpunk - Edgerunners S1 (Dual-Audio) x265 HDR 10bit 1080p 119.88fps"))
+
+    def test_batch_detection(self):
+        self.assertTrue(main.is_batch_release(
+            "[Erai-raws] Cyberpunk: Edgerunners 2 - 01 ~ 10 [1080p NF WEB-DL HEVC EAC3][MultiSub] [BATCH]"))
+        self.assertTrue(main.is_batch_release("[Anime Time] Cyberpunk Edgerunners (Season 1) [BD] [Batch]"))
+        self.assertTrue(main.is_batch_release("[Group] Show (01-12) [1080p]"))
+        self.assertFalse(main.is_batch_release("[SubsPlease] Ao no Hako Season 2 - 04 (1080p) [AAAA].mkv"))
+        self.assertFalse(main.is_batch_release("[SubsPlease] Spy x Family S2 - 05 (1080p)"))
+
+    def test_anilist_season(self):
+        self.assertEqual(main.anilist_season_number("Cyberpunk: Edgerunners 2"), 2)
+        self.assertEqual(main.anilist_season_number("Aoashi 2nd Season"), 2)
+        self.assertEqual(main.anilist_season_number("Ranma 1/2 (2024) 3rd Season"), 3)
+        self.assertEqual(main.anilist_season_number("Ao no Hako Season 2"), 2)
+        self.assertIsNone(main.anilist_season_number("Kaiju No. 8"))
+        self.assertIsNone(main.anilist_season_number("Chitose-kun wa Ramune Bin no Naka Part 2"))
+        self.assertIsNone(main.anilist_season_number("Hotaru no Yomeiri"))
+
+    def test_release_season(self):
+        self.assertEqual(main.extract_season_number("Cyberpunk - Edgerunners S1 (Dual-Audio)"), 1)
+        self.assertEqual(main.extract_season_number("Firefly Wedding S01E02 Tennyo"), 1)
+        self.assertEqual(main.extract_season_number("Cyberpunk Edgerunners (Season 1) [BD]"), 1)
+        self.assertIsNone(main.extract_season_number("[Erai-raws] Cyberpunk: Edgerunners 2 - 05 [1080p]"))
+        self.assertIsNone(main.extract_season_number("[ASW] Show - 05 [1080p HEVC x265][MultiSubs]"))
+
+
+class ProgressBucketTests(unittest.TestCase):
+    def test_buckets(self):
+        from torrent_automator.anilist import progress_bucket, _media_info
+        airing = _media_info({"title": {"romaji": "X"}, "episodes": 12, "status": "RELEASING",
+                              "nextAiringEpisode": {"episode": 7, "airingAt": 0}})
+        self.assertEqual(airing["aired"], 6)
+        self.assertEqual(progress_bucket(dict(airing, progress=3)), "behind")
+        self.assertEqual(progress_bucket(dict(airing, progress=6)), "caught_up")
+        done = _media_info({"title": {"romaji": "Y"}, "episodes": 10, "status": "FINISHED"})
+        self.assertEqual(progress_bucket(dict(done, progress=0)), "finished")
+        self.assertEqual(progress_bucket(dict(done, progress=10)), "caught_up")
+        # airing with no schedule known: can't tell, treat as up to date
+        hiatus = _media_info({"title": {"romaji": "Z"}, "episodes": None, "status": "RELEASING"})
+        self.assertEqual(progress_bucket(dict(hiatus, progress=4)), "caught_up")
+        upcoming = _media_info({"title": {"romaji": "W"}, "status": "NOT_YET_RELEASED"})
+        self.assertEqual(progress_bucket(dict(upcoming, progress=0)), "caught_up")
+
+
 class QueryTokenTests(unittest.TestCase):
     def test_title_ending_with_season(self):
         # used to raise "not enough values to unpack" and abort the batch run

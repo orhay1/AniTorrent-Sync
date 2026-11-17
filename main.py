@@ -34,24 +34,64 @@ def extract_episode_number(title: str) -> str | None:
              .replace("—", "-")
              .replace("_", " ")
     )
-    patterns = [
-        r"[Ss](\d{1,2})[Ee](\d{1,3}(?:v\d)?)",
-        r"[Ss]eason\s*\d{1,2}\s*[- ]\s*(\d{1,3}(?:v\d)?)",
-        r"[Ee]pisode\s*(\d{1,3}(?:v\d)?)",
-        r"[- ](\d{1,3}(?:v\d)?)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, clean)
-        if m:
-            ep = m.group(2) if len(m.groups()) >= 2 else m.group(1)
-            if ep in ("720", "1080", "2160"):
+    for pat in _EPISODE_PATTERNS:
+        for m in re.finditer(pat, clean):
+            ep = m.group(m.lastindex)
+            if re.sub(r"v\d", "", ep) in ("480", "576", "720", "1080", "2160"):
                 continue
             return ep.zfill(2)
     return None
 
 
+# Order matters: the most explicit forms first. The trailing (?![\w.]) stops a
+# number glued to letters or a decimal point ("8bit", "10bit", "1080p",
+# "119.88fps", "x265") from being read as an episode.
+_EPISODE_PATTERNS = [
+    r"\b[Ss](\d{1,2})[Ee](\d{1,3}(?:v\d)?)(?![\w.])",           # S01E05
+    r"[Ss]eason\s*\d{1,2}\s*[- ]\s*(\d{1,3}(?:v\d)?)(?![\w.])",  # Season 2 - 05
+    r"[Ee]pisode\s*(\d{1,3}(?:v\d)?)(?![\w.])",                 # Episode 5
+    r"\s-\s+(\d{1,3}(?:v\d)?)(?![\w.])",                        # Title - 05
+    r"\[(\d{1,3}(?:v\d)?)\]",                                   # [Group][Title][05]
+    r"(?:^|[\s-])(\d{1,3}(?:v\d)?)(?![\w.])",                    # Title 05 (last resort)
+]
+
+
+def is_batch_release(title: str) -> bool:
+    """True for multi-episode packs like "01 ~ 10", "01-12" or "[Batch]"."""
+    t = (title or "").lower().replace("–", "-").replace("～", "~")
+    if re.search(r"\b(batch|complete series)\b", t):
+        return True
+    if re.search(r"\b\d{1,3}\s*~\s*\d{1,3}\b", t):
+        return True
+    if re.search(r"(?:^|[\s\[(])\d{2,3}\s?-\s?\d{2,3}(?![\w.])", t):
+        return True
+    return False
+
+
+def anilist_season_number(title: str) -> int | None:
+    """
+    Season number from an AniList title: "X 2nd Season", "X Season 3", "X S2",
+    or a trailing number like "Cyberpunk: Edgerunners 2" (but not "Kaiju No. 8"
+    or "... Part 2").
+    """
+    t = (title or "").lower().strip()
+    m = (re.search(r"\b(\d{1,2})(?:st|nd|rd|th)\s+season\b", t)
+         or re.search(r"\bseason\s*(\d{1,2})\b", t)
+         or re.search(r"\bs(\d{1,2})\b", t))
+    if m:
+        return int(m.group(1))
+    words = re.sub(r"[^\w\s.]", " ", t).split()
+    if len(words) >= 2 and words[-1].isdigit() and len(words[-1]) <= 2:
+        if words[-2] not in ("no", "no.", "part", "cour", "vol", "vol.", "#"):
+            return int(words[-1])
+    return None
+
+
 def extract_season_number(title: str) -> int | None:
-    m = re.search(r"[Ss](\d{1,2})", title) or re.search(r"[Ss]eason\s*(\d{1,2})", title)
+    # \b keeps "S2" / "S01E05" but ignores an "s" glued inside another word
+    m = (re.search(r"\b[Ss](\d{1,2})(?=[Ee]\d|\b)", title)
+         or re.search(r"[Ss]eason\s*(\d{1,2})\b", title)
+         or re.search(r"\b(\d{1,2})(?:st|nd|rd|th)\s+[Ss]eason\b", title))
     return int(m.group(1)) if m else None
 
 
@@ -230,7 +270,7 @@ async def build_batch_plan(config: dict, log_cb: LogFn = None, anilist: dict | N
         info = anilist[matched_title]
         prog = int(info.get("progress") or 0)
         season_total = info.get("episodes")
-        current_season = extract_season_number(matched_title) or 1  # assume 1 if missing
+        current_season = anilist_season_number(info.get("title") or matched_title) or 1  # assume 1 if missing
         sp.matched_title = info.get("title") or matched_title
         sp.progress = prog
         sp.total_episodes = season_total
@@ -251,7 +291,11 @@ async def build_batch_plan(config: dict, log_cb: LogFn = None, anilist: dict | N
         # Bucket every newer episode (from any group) by (season, episode)
         buckets: dict[tuple[int, int], list[dict]] = {}
         ep_labels: dict[tuple[int, int], str] = {}
+        skipped_batches = 0
         for r in raw:
+            if is_batch_release(r["title"]):
+                skipped_batches += 1  # batch automation grabs single episodes only
+                continue
             ep_s = extract_episode_number(r["title"])
             ep = _episode_int(ep_s)
             if ep is None:
