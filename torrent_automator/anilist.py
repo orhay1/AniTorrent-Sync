@@ -116,8 +116,11 @@ async def search_anilist(search: str | None = None, page: int = 1, per_page: int
         "page": page,
         "perPage": per_page,
         "sort": ["SEARCH_MATCH", "POPULARITY_DESC"] if search else ["TRENDING_DESC", "POPULARITY_DESC"],
-        "status": None if search else "RELEASING",
     }
+    # Note: AniList treats an explicit `status: null` as a filter that matches nothing,
+    # so the variable must be omitted entirely when searching.
+    if not search:
+        variables["status"] = "RELEASING"
     data = await _post(query, variables)
     if data.get("errors"):
         raise RuntimeError(data["errors"][0].get("message", "AniList error"))

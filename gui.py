@@ -296,6 +296,7 @@ class TorrentAutomatorGUI(QMainWindow):
         ll.addLayout(brow)
         del_action = QAction(self.shows_list)
         del_action.setShortcut(QKeySequence.StandardKey.Delete)
+        del_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         del_action.triggered.connect(self._remove_selected_shows)
         self.shows_list.addAction(del_action)
         left.setMinimumWidth(280)

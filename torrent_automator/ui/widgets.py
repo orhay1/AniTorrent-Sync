@@ -69,6 +69,11 @@ class CardDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index):
         return QSize(self.cw + 2 * self.pad, self.ch + self.text_h + 2 * self.pad)
 
+    def editorEvent(self, event, model, option, index):
+        # CoverGrid toggles on click itself; stop the default checkbox handling from
+        # toggling a second time when the click lands where Qt draws the indicator.
+        return False
+
     def paint(self, p: QPainter, option, index):
         c = theme.colors()
         p.save()
@@ -221,6 +226,12 @@ class CoverGrid(QListWidget):
                          else Qt.CheckState.Checked)
         self.checkedChanged.emit()
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.currentItem():
+            self._toggle(self.currentItem())
+            return
+        super().keyPressEvent(event)
+
     def items(self) -> list[QListWidgetItem]:
         return [self.item(i) for i in range(self.count())]
 
@@ -277,7 +288,12 @@ class ThumbList(QListWidget):
     def _apply_icon(self, it: QListWidgetItem):
         pm = cover_or_placeholder(it.data(ROLE_COVER) or "", it.data(ROLE_TITLE) or "",
                                   it.data(ROLE_COLOR) or "", self.THUMB.width(), self.THUMB.height())
-        it.setIcon(QIcon(rounded(pm, 4)))
+        # A cover arriving is not a user edit: don't emit itemChanged for it.
+        was_blocked = self.blockSignals(True)
+        try:
+            it.setIcon(QIcon(rounded(pm, 4)))
+        finally:
+            self.blockSignals(was_blocked)
 
     def items(self) -> list[QListWidgetItem]:
         return [self.item(i) for i in range(self.count())]
@@ -296,8 +312,12 @@ class ThumbList(QListWidget):
     def set_cover(self, key: str, cover: str, color: str = ""):
         it = self.find_key(key)
         if it is not None and cover:
-            it.setData(ROLE_COVER, cover)
-            it.setData(ROLE_COLOR, color)
+            was_blocked = self.blockSignals(True)
+            try:
+                it.setData(ROLE_COVER, cover)
+                it.setData(ROLE_COLOR, color)
+            finally:
+                self.blockSignals(was_blocked)
             self._apply_icon(it)
 
     def _on_cover(self, url: str):
