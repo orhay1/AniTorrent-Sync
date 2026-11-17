@@ -67,6 +67,20 @@ def run(coro):
     return asyncio.run(coro)
 
 
+class QueryTokenTests(unittest.TestCase):
+    def test_title_ending_with_season(self):
+        # used to raise "not enough values to unpack" and abort the batch run
+        self.assertEqual(main._safe_query_tokens("Aoashi 2nd Season", "1080p", ""),
+                         ["aoashi 2nd season 1080p", "aoashi 2nd s 1080p"])
+
+    def test_numbered_season(self):
+        self.assertEqual(main._safe_query_tokens("Spy x Family Season 2", "1080p", "HEVC"), [
+            "spy x family season 2 1080p HEVC",
+            "spy x family s 2 1080p HEVC",
+            "spy x family 2 1080p HEVC",
+        ])
+
+
 @mock.patch.object(main, "fetch_nyaa_rss", fake_rss)
 @mock.patch.object(main, "extract_magnet", fake_magnet)
 class PlanTests(unittest.TestCase):
